@@ -11,7 +11,7 @@ I have bunch of mp3 audiobooks that I wanted to play wherever I am away from my 
 ## Features
 - PHP or ASP.NET
 - Desktop and Mobile friendly
-- MySQL to store metadata
+- MySQL to store metadata (each folder name with mp3 files has to have unique name)
 - Assumes each folder holds one audiobook
 - Offline mode let you download files
 - VB Script that Selenium  to scrape the web and update Book info (Link, Title, Author, Rating, Pub date)
