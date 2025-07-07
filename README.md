@@ -13,7 +13,7 @@ I have bunch of mp3 audiobooks that I wanted to play wherever I am away from my 
 - Desktop and Mobile friendly
 - MySQL to store metadata
 - Assumes each folder holds one audiobook
-- Offline mode let you download and folders
+- Offline mode let you download files
 - VB Script that Selenium  to scrape the web and update Book info (Link, Title, Author, Rating, Pub date)
 - Ability to set my own rating
 
