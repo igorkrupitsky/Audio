@@ -30,7 +30,40 @@ function getBasePathAndStart() {
         .catch(err => showError(err.message));
 }
 
-document.addEventListener('DOMContentLoaded', getBasePathAndStart);
+document.addEventListener('DOMContentLoaded', function(){
+    getBasePathAndStart();
+    setupShareLink();
+});
+
+function setupShareLink() {
+    const shareLink = document.getElementById('shareLink');
+    if (shareLink) {
+        shareLink.addEventListener('click', function(e) {
+
+            var o = document.querySelector('span.share-link-feedback');
+            if (o == null) return;
+
+            e.preventDefault();
+            o.style.display = "";
+            setTimeout(() => {
+                        if (o) o.style.display = "none";
+            }, 1500);
+
+            const url = shareLink.href;
+
+            if (navigator.clipboard) {
+                navigator.clipboard.writeText(url);
+            } else {
+                const tempInput = document.createElement('input');
+                tempInput.value = url;
+                document.body.appendChild(tempInput);
+                tempInput.select();
+                document.execCommand('copy');
+                document.body.removeChild(tempInput);
+            }
+        });
+    }
+}
 
 // Handle window resize for responsive DataTable behavior
 window.addEventListener('resize', function() {

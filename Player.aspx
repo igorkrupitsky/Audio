@@ -21,6 +21,7 @@
         
         <div id="shareDiv" style="float: right" title="Share Link">
             <a target="_blank" id="shareLink">&#128279;</a>
+            <span class="share-link-feedback" style="display: none">Link copied!</span>
             <span id="editButton" title="Edit" onclick="OpenFolderDialog(false)">&#x270E;</span>
         </div>
         

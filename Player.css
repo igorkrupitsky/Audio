@@ -304,3 +304,12 @@ a.AmazonLink {
         font-size: 0.9em;
     }
 }
+
+span.share-link-feedback {
+    background: rgb(223, 240, 216); 
+    color: rgb(60, 118, 61); 
+    border: 1px solid rgb(60, 118, 61); 
+    border-radius: 4px; 
+    padding: 2px 8px; 
+    font-size: 0.95em; 
+}
