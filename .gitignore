@@ -1,0 +1,5 @@
+# Ignore config file with sensitive credentials
+config.php
+web.config
+Russian/
+bin/

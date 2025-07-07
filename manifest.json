@@ -1,0 +1,21 @@
+{
+  "name": "Audio Player",
+  "short_name": "AudioPlayer",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#1976d2",
+  "description": "A web audio player with folder navigation and ratings.",
+  "icons": [
+    {
+      "src": "images/icon192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "images/icon512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

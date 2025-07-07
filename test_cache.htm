@@ -1,0 +1,60 @@
+﻿<!DOCTYPE html>
+<html>
+<head>
+    <title>MP3 Caching Demo</title>
+</head>
+<body>
+    <h1>MP3 Offline Cache Demo</h1>
+    <button onclick="downloadAndCache()">Cache MP3</button>
+    <button onclick="checkIfCached()">Check If Cached</button>
+    <button onclick="playFromCache()">Play Cached MP3</button>
+
+    <script>
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('service-worker.js').then(() => {
+                console.log('Service Worker registered');
+            }).catch(console.error);
+        }
+
+        var sFile = "Russian/Дети Ханны/002 ЧАСТЬ ПЕРВАЯ.mp3"
+
+        async function downloadAndCache() {
+            const cache = await caches.open('mp3-cache');
+            const response = await fetch(sFile);
+
+            if (!response.ok) {
+                alert('Failed to fetch MP3');
+                return;
+            }
+
+            await cache.put(sFile, response.clone());
+            alert('MP3 Cached');
+        }
+
+        async function checkIfCached() {
+            const cache = await caches.open('mp3-cache');
+            const match = await cache.match(sFile);
+            if (match) {
+                alert('MP3 is cached!');
+            } else {
+                alert('MP3 is NOT cached.');
+            }
+        }
+
+        async function playFromCache() {
+            const cache = await caches.open('mp3-cache');
+            const response = await cache.match(sFile);
+            if (!response) {
+                alert('No cached MP3 found.');
+                return;
+            }
+
+            const blob = await response.blob();
+            const url = URL.createObjectURL(blob);
+
+            const audio = new Audio(url);
+            audio.play();
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+C:\inetpub\wwwroot\Audio\obj\Debug\Audio.vbproj.CoreCompileInputs.cache
+C:\inetpub\wwwroot\Audio\bin\Audio.dll.config
+C:\inetpub\wwwroot\Audio\bin\Audio.dll
+C:\inetpub\wwwroot\Audio\bin\Audio.pdb
+C:\inetpub\wwwroot\Audio\bin\Audio.xml
+C:\inetpub\wwwroot\Audio\obj\Debug\Audio.dll
+C:\inetpub\wwwroot\Audio\obj\Debug\Audio.xml
+C:\inetpub\wwwroot\Audio\obj\Debug\Audio.pdb
+C:\inetpub\wwwroot\Audio\obj\Debug\Audio.vbproj.AssemblyReference.cache
