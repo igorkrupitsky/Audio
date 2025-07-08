@@ -11,10 +11,14 @@ I have bunch of mp3 audiobooks that I wanted to play wherever I am away from my 
 ## Features
 - PHP or ASP.NET
 - Desktop and Mobile friendly
+- Auto-play next track
+- Go back 30 seconds
+- Breadcrumb  trail to go up the folders tree
+- Ability to bookmark any audiobook
 - MySQL to store metadata (each folder name with mp3 files has to have unique name)
 - Assumes each folder holds one audiobook
-- Offline mode let you download files and listen to them when not connected to the internet
-- VB Script that Selenium  to scrape the web and update Book info (Link, Title, Author, Rating, Pub date)
+- Offline mode lets you download files and listen to them when not connected to the internet
+- VB Script that Selenium to scrape the web and update Book info (Link, Title, Author, Rating, Pub date)
 - Ability to set my own rating
 
 ## How to use (PHP):
@@ -22,7 +26,7 @@ I have bunch of mp3 audiobooks that I wanted to play wherever I am away from my 
 - Upload your mp3 audiobooks
 - Copy files from the project to the root folder.
 - Create MySQL database in interserver and run CreateTables.sql
-- Create config.php, update conenction info and copy it to the server next to Player.php
+- Create config.php, update connection info and copy it to the server next to Player.php
 
 ```PHP
 <?php
@@ -35,12 +39,14 @@ return [
 ];
 ```
 
+Point your browser to Player.php
+
 ## How to use (ASP.NET):
 - Buy purchase from godaddy ($6 per month for 25 GB) https://www.godaddy.com/hosting-solutions
 - Upload your mp3 audiobooks
 - Copy files from the project to the root folder.
 - Create MySQL database in godaddy and run CreateTables.sql
-- Create web.config, update conenction info and copy it to the server next to Player.php
+- Create web.config, update connection info and copy it to the server next to Player.php
 
 ```XML
 <?xml version="1.0"?>
@@ -51,7 +57,7 @@ return [
 </configuration>
 ```
 
-Point your browser to Player.php
+Point your browser to Player.aspx
 
 ## How to use VBS:
 - Create VBS\db_connection.txt and put connection string like
@@ -66,4 +72,4 @@ Server=123.123.123.123;Database=Audio;User=Audio;Password=pass123;Option=3;
 3. will update Book info for folders that were moved to another location
 
 - VBS\UpdateIndex.vbs
-1. will use Selium Basic to Google book info and update the database
+1. will use Selenium Basic to Google book info and use Amazon to update the data to update the database
