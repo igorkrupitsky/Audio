@@ -107,18 +107,8 @@ function loadFolder(path) {
                         if (document.getElementById('editFolderModal')) {
                             document.getElementById('editFolderPath').value = data.CurrentPath || '';
                             document.getElementById('editTitle').value = data.Title || '';
-                            document.getElementById('editTitleUrl').value = data.TitleUrl || '';
-                            
-                            var sMyRating = "5.0";
-                            if (data.MyRating && data.MyRating != ""){
-                                sMyRating = data.MyRating;
-                            }
-
-                            if (parseInt(sMyRating) == parseFloat(sMyRating)){
-                                sMyRating += ".0"; // Ensure it has one decimal place
-                            }
-
-                            document.getElementById('editMyRating').value = sMyRating;
+                            document.getElementById('editTitleUrl').value = data.TitleUrl || '';                         
+                            document.getElementById('editMyRating').value = GetMyRating(data);
                         }                        
                     }
                 } catch (err) {
@@ -134,6 +124,18 @@ function loadFolder(path) {
         showError('Network error');
     };
     xhr.send('folderPath=' + encodeURIComponent(path));
+}
+
+function GetMyRating(data) {
+    if (data.MyRating && data.MyRating != "") {
+        var s = data.MyRating;
+        if (parseInt(s) == parseFloat(s)) {
+            s += ".0"; // Ensure it has one decimal place
+        }
+        return s;
+    } else {
+        return "";
+    }
 }
 
 function renderRatings(data) {
@@ -665,7 +667,7 @@ function OpenFolderDialog(bTable, data) {
         document.getElementById('editFolderPath').value = folderData.CurrentPath || '';
         document.getElementById('editTitle').value = folderData.Title || '';
         document.getElementById('editTitleUrl').value = folderData.TitleUrl || '';
-        document.getElementById('editMyRating').value = folderData.MyRating || '';
+        document.getElementById('editMyRating').value = GetMyRating(folderData);
         document.getElementById('editRate').value = folderData.TitleRating || '';
         document.getElementById('editRateCount').value = folderData.RateCount || '';
         document.getElementById('editAuthor').value = folderData.Author || '';
