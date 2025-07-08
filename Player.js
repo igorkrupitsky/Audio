@@ -565,14 +565,14 @@ function loadTracks() {
         }
     }, 5000);
 
-    let lastAdvanceTime = 0;
+    var startTime = 0;
 
     // Auto-play next track
     audio.addEventListener("ended", () => {
 
-        const now = Date.now();
-        if (now - lastAdvanceTime < 1000) return;  
-        lastAdvanceTime = now;
+        let endTime = performance.now();
+        if (startTime > 0 && endTime - startTime < 1000) return;
+        startTime = endTime;
 
         const currentIndex = selector.selectedIndex;
         if (currentIndex >= 0 && currentIndex < selector.options.length - 1) {
