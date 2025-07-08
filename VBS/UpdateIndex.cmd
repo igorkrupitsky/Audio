@@ -1,0 +1,1 @@
+wscript /x "C:\inetpub\wwwroot\Audio\VBS\UpdateIndex.vbs"
