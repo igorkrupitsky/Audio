@@ -6,8 +6,8 @@
     <link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css">
     <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
     <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
-    <script src="Player.js?v=14"></script>
-    <link href="Player.css?v=12" rel="stylesheet" />
+    <script src="Player.js?v=23"></script>
+    <link href="Player.css?v=23" rel="stylesheet" />
     <link rel="manifest" href="manifest.json">
     <meta name="theme-color" content="#1976d2">
     <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -19,7 +19,7 @@
     <form id="form1">
         <div id="breadcrumb" class="breadcrumb"></div>
         
-        <div id="shareDiv" style="float: right" title="Share Link">
+        <div id="shareDiv" style="float: right; display: none" title="Share Link">
             <a target="_blank" id="shareLink">&#128279;</a>
             <span class="share-link-feedback" style="display: none">Link copied!</span>
             <span id="editButton" title="Edit" onclick="OpenFolderDialog(false)">&#x270E;</span>

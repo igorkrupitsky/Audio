@@ -203,7 +203,10 @@ function renderContent(data) {
     const selector = document.getElementById("trackSelector");
     const playerControl = document.getElementById("playerControl");
     const shareDiv = document.getElementById("shareDiv");
+
     selector.length = 0;
+    playerControl.style.display = "none";
+    shareDiv.style.display = "none";
 
     // Clean up existing DataTable if it exists
     if (typeof $ !== 'undefined' && $.fn.DataTable && $.fn.DataTable.isDataTable('#subfoldersTable')) {
@@ -433,9 +436,6 @@ function renderContent(data) {
             
             container.innerHTML = "<ul>" + html + "</ul>";
         }
-
-        playerControl.style.display = "none";
-        shareDiv.style.display = "none";
 
     } else if (data.Mp3Files.length > 0) {
 
