@@ -13,7 +13,7 @@ I have bunch of mp3 audiobooks that I wanted to play wherever I am away from my 
 - Desktop and Mobile friendly
 - MySQL to store metadata (each folder name with mp3 files has to have unique name)
 - Assumes each folder holds one audiobook
-- Offline mode let you download files
+- Offline mode let you download files and listen to them when not connected to the internet
 - VB Script that Selenium  to scrape the web and update Book info (Link, Title, Author, Rating, Pub date)
 - Ability to set my own rating
 
@@ -21,7 +21,7 @@ I have bunch of mp3 audiobooks that I wanted to play wherever I am away from my 
 - Buy storage from interserver ($3 per month for 1 TB) https://www.interserver.net/storage/
 - Upload your mp3 audiobooks
 - Copy files from the project to the root folder.
-- Create MySQL database in interserver
+- Create MySQL database in interserver and run CreateTables.sql
 - Create config.php, update conenction info and copy it to the server next to Player.php
 
 ```PHP
@@ -39,7 +39,7 @@ return [
 - Buy purchase from godaddy ($6 per month for 25 GB) https://www.godaddy.com/hosting-solutions
 - Upload your mp3 audiobooks
 - Copy files from the project to the root folder.
-- Create MySQL database in godaddy
+- Create MySQL database in godaddy and run CreateTables.sql
 - Create web.config, update conenction info and copy it to the server next to Player.php
 
 ```XML
@@ -53,3 +53,17 @@ return [
 
 Point your browser to Player.php
 
+## How to use VBS:
+- Create VBS\db_connection.txt and put connection string like
+
+```
+Server=123.123.123.123;Database=Audio;User=Audio;Password=pass123;Option=3;
+```
+
+- VBS\MakeIndex.vbs 
+1. will add a record in the Folder table
+2. will remove old folders
+3. will update Book info for folders that were moved to another location
+
+- VBS\UpdateIndex.vbs
+1. will use Selium Basic to Google book info and update the database
