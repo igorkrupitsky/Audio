@@ -6,8 +6,8 @@
     <link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css">
     <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
     <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
-    <script src="Player.js?v=23"></script>
-    <link href="Player.css?v=23" rel="stylesheet" />
+    <script src="Player.js?v=28"></script>
+    <link href="Player.css?v=28" rel="stylesheet" />
     <link rel="manifest" href="manifest.json">
     <meta name="theme-color" content="#1976d2">
     <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -33,7 +33,7 @@
             <div class="controls">
                 <a onclick="goBack30()" class="player-button"> Go Back 30 seconds</a>
                 <a onclick="goUpOneLevel()" class="player-button"> Go Back</a>
-                <a onclick="cacheFolder()" class="player-button"> Cache Folder</a>
+                <a onclick="cacheFolder()" class="player-button" id="btnCacheFolder"> Cache Folder</a>
             </div>
         </div>
 

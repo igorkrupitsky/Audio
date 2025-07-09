@@ -102,13 +102,8 @@ function loadFolder(path) {
                         renderBreadcrumb(data);
                         renderRatings(data);
                         renderContent(data);
-
-                        // Update editFolderModal inputs
                         if (document.getElementById('editFolderModal')) {
-                            document.getElementById('editFolderPath').value = data.CurrentPath || '';
-                            document.getElementById('editTitle').value = data.Title || '';
-                            document.getElementById('editTitleUrl').value = data.TitleUrl || '';                         
-                            document.getElementById('editMyRating').value = GetMyRating(data);
+                            SetModal(data);
                         }                        
                     }
                 } catch (err) {
@@ -663,26 +658,28 @@ function HideSpinner() {
 function OpenFolderDialog(bTable, data) {
     editDialogOpenedFromTable = bTable;
     const folderData = data || currentData;
-    if (folderData) {
-        document.getElementById('editFolderPath').value = folderData.CurrentPath || '';
-        document.getElementById('editTitle').value = folderData.Title || '';
-        document.getElementById('editTitleUrl').value = folderData.TitleUrl || '';
-        document.getElementById('editMyRating').value = GetMyRating(folderData);
-        document.getElementById('editRate').value = folderData.TitleRating || '';
-        document.getElementById('editRateCount').value = folderData.RateCount || '';
-        document.getElementById('editAuthor').value = folderData.Author || '';
-        document.getElementById('editCategory').value = folderData.Category || '';
-        document.getElementById('editPublicationDate').value = folderData.PubDate || '';
-        
-        let relPath = folderData.CurrentPath || '';
-        if (relPath.startsWith(basePath)) {
-            relPath = relPath.substring(basePath.length);
-            relPath = relPath.replace(/^[/\\]+/, '');
-        }
-        
-        document.getElementById('editModalHeader').textContent = relPath;
-    }
+    if (folderData) SetModal(folderData);
     document.getElementById("editFolderModal").showModal();
+}
+
+function SetModal(folderData) {
+    document.getElementById('editFolderPath').value = folderData.CurrentPath || '';
+    document.getElementById('editTitle').value = folderData.Title || '';
+    document.getElementById('editTitleUrl').value = folderData.TitleUrl || '';
+    document.getElementById('editMyRating').value = GetMyRating(folderData);
+    document.getElementById('editRate').value = folderData.TitleRating || '';
+    document.getElementById('editRateCount').value = folderData.RateCount || '';
+    document.getElementById('editAuthor').value = folderData.Author || '';
+    document.getElementById('editCategory').value = folderData.Category || '';
+    document.getElementById('editPublicationDate').value = folderData.PubDate || '';
+
+    let relPath = folderData.CurrentPath || '';
+    if (relPath.startsWith(basePath)) {
+        relPath = relPath.substring(basePath.length);
+        relPath = relPath.replace(/^[/\\]+/, '');
+    }
+
+    document.getElementById('editModalHeader').textContent = relPath;
 }
 
 function CloseFolderDialog() {
@@ -773,11 +770,17 @@ async function setAudioFile(audio, sFile) {
 }
 
 async function cacheFolder() {
+    var sOldVal = btnCacheFolder.innerHTML;
+    var btnCacheFolder = document.getElementById("btnCacheFolder");
+    btnCacheFolder.value = "Caching..."
+
     const selector = document.getElementById("trackSelector");
     for (var i = 0; i < selector.options.length; i++) {
         var sFile = selector.options[i].value;
         await downloadAndCache(sFile, i);
     }
+
+    btnCacheFolder.innerHTML = sOldVal;
 }
 
 async function downloadAndCache(sFile, i) {
@@ -817,7 +820,7 @@ async function checkCache(sFile, i) {
 function setCacheIcon(i, match) {
     const span = document.querySelector(`li.file[data-index="${i}"] span.downloaded`);
     if (match) {
-        span.innerHTML = "&#x1F5F8; "; //Check Mark
+        span.innerHTML = "&#x2611; "; //Check Mark &#x1F5F8;
     } else {
         span.innerHTML = "&#x25CB; "; //White Circle
     }
