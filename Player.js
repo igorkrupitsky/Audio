@@ -770,8 +770,8 @@ async function setAudioFile(audio, sFile) {
 }
 
 async function cacheFolder() {
-    var sOldVal = btnCacheFolder.innerHTML;
     var btnCacheFolder = document.getElementById("btnCacheFolder");
+    var sOldVal = btnCacheFolder.innerHTML;
     btnCacheFolder.value = "Caching..."
 
     const selector = document.getElementById("trackSelector");
