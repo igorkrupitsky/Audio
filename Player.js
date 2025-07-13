@@ -43,6 +43,13 @@ function getBasePathAndStart() {
             const volumeDisplay = document.getElementById('volumeDisplay');
             volumeDisplay.textContent = `${Math.round(gainValue * 100)}%`;
         })
+    };
+
+    const divSlider = document.getElementById("divSlider");
+    if (window.innerWidth < 1000) {
+        $("#divSlider").show()
+    } else {
+        $("#divSlider").hide()
     }
 }
 
@@ -214,12 +221,10 @@ function renderContent(data) {
     const selector = document.getElementById("trackSelector");
     const playerControl = document.getElementById("playerControl");
     const shareDiv = document.getElementById("shareDiv");
-    const divSlider = document.getElementById("shareDiv");
 
     selector.length = 0;
     playerControl.style.display = "none";
-    shareDiv.style.display = "none";
-    divSlider.style.display = "none";
+    shareDiv.style.display = "none";    
 
     // Clean up existing DataTable if it exists
     if (typeof $ !== 'undefined' && $.fn.DataTable && $.fn.DataTable.isDataTable('#subfoldersTable')) {
@@ -454,10 +459,6 @@ function renderContent(data) {
 
         playerControl.style.display = "";
         shareDiv.style.display = "";
-
-        if (window.innerWidth < 1000) {
-            divSlider.style.display = "";
-        }
 
         html += '';
         sCurrentFolder = data.CurrentFolder;
