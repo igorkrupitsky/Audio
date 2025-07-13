@@ -6,8 +6,8 @@
     <link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css">
     <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
     <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
-    <script src="Player.js?v=30"></script>
-    <link href="Player.css?v=30" rel="stylesheet" />
+    <script src="Player.js?v=36"></script>
+    <link href="Player.css?v=36" rel="stylesheet" />
     <link rel="manifest" href="manifest.json">
     <meta name="theme-color" content="#1976d2">
     <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -26,6 +26,11 @@
         </div>
         
         <div id="ratings"></div>
+
+        <div id="divSlider" style="display: flex; align-items: center; width: 100%; gap: 10px; display: none">
+            <input type="range" id="volumeSlider" min="0" max="5" step="0.01" value="1" style="flex-grow: 1">
+            <span id="volumeDisplay">100%</span>
+        </div>
 
         <div id="playerControl" style="display:none">
             <select id="trackSelector"></select>

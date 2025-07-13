@@ -2,6 +2,9 @@ let basePath = '';
 let sFolderSep = '\\';
 let sCurrentFolder = "";
 let currentData = null;
+let gainNode = null;
+let audioCtx = null;
+let bAudioGaininitialized = false;
 
 // Global flag to track dialog source
 let editDialogOpenedFromTable = false;
@@ -28,6 +31,19 @@ function getBasePathAndStart() {
             loadFolder(savedPath);
         })
         .catch(err => showError(err.message));
+
+    const volumeSlider = document.getElementById('volumeSlider');
+    if (volumeSlider) {
+        volumeSlider.addEventListener('input', () => {
+            initializeAudioGain();
+
+            const gainValue = parseFloat(volumeSlider.value);
+            if (gainNode) gainNode.gain.value = gainValue;
+
+            const volumeDisplay = document.getElementById('volumeDisplay');
+            volumeDisplay.textContent = `${Math.round(gainValue * 100)}%`;
+        })
+    }
 }
 
 document.addEventListener('DOMContentLoaded', function(){
@@ -198,10 +214,12 @@ function renderContent(data) {
     const selector = document.getElementById("trackSelector");
     const playerControl = document.getElementById("playerControl");
     const shareDiv = document.getElementById("shareDiv");
+    const divSlider = document.getElementById("shareDiv");
 
     selector.length = 0;
     playerControl.style.display = "none";
     shareDiv.style.display = "none";
+    divSlider.style.display = "none";
 
     // Clean up existing DataTable if it exists
     if (typeof $ !== 'undefined' && $.fn.DataTable && $.fn.DataTable.isDataTable('#subfoldersTable')) {
@@ -209,7 +227,7 @@ function renderContent(data) {
     }
 
     if (data.Subfolders.length > 0) {
-        const isWideScreen = window.innerWidth > 1000;  
+        const isWideScreen = window.innerWidth > 1000;
         
         if (isWideScreen) {
             // Use DataTables for wide screens
@@ -436,6 +454,10 @@ function renderContent(data) {
 
         playerControl.style.display = "";
         shareDiv.style.display = "";
+
+        if (window.innerWidth < 1000) {
+            divSlider.style.display = "";
+        }
 
         html += '';
         sCurrentFolder = data.CurrentFolder;
@@ -824,4 +846,30 @@ function setCacheIcon(i, match) {
     } else {
         span.innerHTML = "&#x25CB; "; //White Circle
     }
+}
+
+
+function initializeAudioGain() {
+    if (bAudioGaininitialized) return;
+    bAudioGaininitialized = true;
+
+    const volumeSlider = document.getElementById('volumeSlider');
+    const audioElement = document.getElementById('audioPlayer');
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const source = audioCtx.createMediaElementSource(audioElement);
+    gainNode = audioCtx.createGain();
+
+    // Set initial volume
+    gainNode.gain.value = parseFloat(volumeSlider.value);
+
+    // Connect source -> gain -> output
+    source.connect(gainNode);
+    gainNode.connect(audioCtx.destination);
+
+    // Resume context on play (required in some browsers)
+    audioElement.addEventListener('play', () => {
+        if (audioCtx.state === 'suspended') {
+            audioCtx.resume();
+        }
+    });
 }

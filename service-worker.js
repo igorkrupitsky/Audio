@@ -1,9 +1,9 @@
 // Update this cache name when you change any of the cached URLs
-const CACHE_NAME = 'audio-player-app-30';
+const CACHE_NAME = 'audio-player-app-36';
 
 const urlsToCache = [
-    'Player.js?v=30',
-    'Player.css?v=30',
+    'Player.js?v=36',
+    'Player.css?v=36',
     'Player.php',
     'manifest.json',
     'images/icon192.png',
