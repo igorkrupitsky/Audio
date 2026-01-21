@@ -825,7 +825,7 @@ if ($mode === 'json') {
             <audio id="audioPlayer" controls></audio>
 
             <div class="controls">
-                <button type="button" class="pl-btn" onclick="goBackSec(-30)">-30</button>
+                <button type="button" class="pl-btn" onclick="goBackSec(30)">-30</button>
                 <button type="button" class="pl-btn" onclick="goForwardSec(30)">+30</button>
                 <button type="button" class="pl-btn" onclick="cacheFolder()" id="btnCacheFolder"> Cache</button>
                 <button type="button" class="pl-btn" id="playPauseButton" title="Play/Pause">▶︎</button>
