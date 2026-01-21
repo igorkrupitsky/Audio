@@ -41,6 +41,16 @@ return [
 
 Point your browser to Player.php
 
+### Google Sign-In (PHP)
+
+The PHP version uses Google Identity Services. The server-side validator lives in `Auth/GoogleSignIn.php` and stores users in the `AppUser` table.
+
+1. Create a Google OAuth Client ID (Web) in Google Cloud Console.
+2. Configure **Authorized JavaScript origins** to include your site (e.g. `https://yourdomain.com`).
+3. On the server, set an environment variable named `GOOGLE_CLIENT_ID` to your `*.apps.googleusercontent.com` value.
+
+When `GOOGLE_CLIENT_ID` is present, `Player.php` will show a Google sign-in button and will POST the returned `credential` JWT to `Auth/GoogleSignIn.php`.
+
 ## How to use (ASP.NET):
 - Buy purchase from godaddy ($6 per month for 25 GB) https://www.godaddy.com/hosting-solutions
 - Upload your mp3 audiobooks

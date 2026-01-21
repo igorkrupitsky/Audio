@@ -27,16 +27,25 @@ sSql = "UPDATE Folder a" & _
     "  JOIN Folder b ON b.FolderName = a.FolderName " & _
     " SET a.BookName = b.BookName, " & _
     " a.Url = b.Url, " & _
-    " a.PublicationDateText = a.PublicationDateText," & _
-    " a.PublicationDate = a.PublicationDate," & _
+    " a.PublicationDateText = b.PublicationDateText," & _
+    " a.PublicationDate = b.PublicationDate," & _
     " a.Author = b.Author," & _
-    " a.Category = a.Category," & _
-    " a.RateCount = a.RateCount," & _
-    " a.Rate = a.Rate," & _
-    " a.MyRate = a.MyRate" & _
+    " a.Category = b.Category," & _
+    " a.RateCount = b.RateCount," & _
+    " a.Rate = b.Rate," & _
+    " a.MyRate = b.MyRate" & _
     " WHERE a.FolderExists = 1" & _
     "  AND a.Url IS null" & _
     "  AND b.FolderExists IS null" 
+cn.Execute sSql
+
+'Update UserRating.FolderId to new existing folders
+sSql = "UPDATE UserRating r" & _
+    "  JOIN Folder old ON old.FolderId = r.FolderId " & _
+    "  JOIN Folder new ON new.FolderName = old.FolderName " & _
+    " SET r.FolderId = new.FolderId, " & _
+    " WHERE new.FolderExists = 1" & _
+    "  AND old.FolderExists IS null" 
 cn.Execute sSql
 
 sOldFolderCount = GetSqlVal("select count(*) cnt from Folder where FolderExists is null")
@@ -51,6 +60,11 @@ cn.Close
 MsgBox "Done"
 
 '--------------------------------------------------------------
+Function GetBaseFolder()
+  Set oFile = fso.GetFile(WScript.ScriptFullName)
+  GetBaseFolder = oFile.ParentFolder
+End Function
+
 Function GetSqlVal(sSql)
     Dim rs: Set rs = cn.Execute(sSql)     
     If Not rs.EOF Then

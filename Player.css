@@ -35,23 +35,6 @@ li {
     font-weight: bold;
 }
 
-.player-button {
-    display: inline-block;
-    padding: 1em 2em;
-    background: #27ae60;
-    color: white;
-    text-decoration: none;
-    font-weight: bold;
-    border-radius: 10px;
-    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.2);
-    margin-bottom: 1em;
-    transition: background 0.3s;
-}
-
-.player-button:hover {
-    background: #219150;
-}
-
 #trackSelector {
     width: 100%;
     font-size: 1em;
@@ -67,21 +50,6 @@ audio {
     margin-top: 1em;
     padding: 10px;
     box-sizing: border-box;
-}
-
-.controls {
-    margin-top: 1em;
-    display: flex;
-    justify-content: space-between;
-    gap: 10px;
-    text-align: center;
-}
-
-.controls a {
-    flex: 1;
-    padding: 10px;
-    font-size: 1em;
-    cursor: pointer;
 }
 
 .spinner-container {
@@ -146,7 +114,27 @@ a.AmazonLink {
     position: fixed;
     overflow: visible;
 }
-#editFolderModal h3 {
+
+#bookmarksModal {
+    border: none;
+    border-radius: 16px;
+    box-shadow: 0 8px 32px rgba(44, 62, 80, 0.25), 0 1.5px 6px rgba(44, 62, 80, 0.10);
+    padding: 0;
+    background: #fff;
+    max-width: 95vw;
+    width: 900px;
+    margin: auto;
+    left: 0;
+    right: 0;
+    top: 50%;
+    transform: translateY(-50%);
+    position: fixed;
+    overflow: visible;
+    max-height: 80vh;
+}
+
+#editFolderModal h3,
+#bookmarksModal h3 {
     margin: 0;
     padding: 1.2em 1.5em 0.5em 1.5em;
     font-size: 1.3em;
@@ -155,6 +143,77 @@ a.AmazonLink {
     background: #f8fafc;
     border-radius: 16px 16px 0 0;
 }
+
+#bookmarksModal > div {
+    padding: 0;
+}
+
+#bookmarksContent {
+    padding: 1.5em;
+    max-height: 55vh;
+    overflow-y: auto;
+}
+
+#bookmarksContent table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+#bookmarksContent thead tr {
+    background: #f8fafc;
+}
+
+#bookmarksContent th {
+    text-align: left;
+    padding: 10px 12px;
+    border-bottom: 2px solid #e0e0e0;
+    color: #2c3e50;
+    font-weight: 600;
+}
+
+#bookmarksContent td {
+    padding: 10px 12px;
+    border-bottom: 1px solid #f0f0f0;
+}
+
+#bookmarksContent tbody tr:hover {
+    background: #f8f9fa;
+}
+
+#bookmarksContent .bookmark-link {
+    color: #2980b9;
+    font-weight: bold;
+    text-decoration: none;
+}
+
+#bookmarksContent .bookmark-link:hover {
+    text-decoration: underline;
+}
+
+#bookmarksModal .dialog-footer {
+    padding: 1em 1.5em;
+    text-align: right;
+    border-top: 1px solid #f0f0f0;
+    background: #f8fafc;
+    border-radius: 0 0 16px 16px;
+}
+
+#bookmarksModal button {
+    background: #6c757d;
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    padding: 0.6em 1.5em;
+    font-size: 1em;
+    font-weight: bold;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+
+#bookmarksModal button:hover {
+    background: #5a6268;
+}
+
 #editFolderForm {
     padding: 1.5em;
     display: flex;
@@ -257,6 +316,43 @@ a.AmazonLink {
         background: #ccc;
         border-radius: 5px;
     }
+
+    /* Mobile-friendly tap targets for control buttons */
+    .pl-btn{
+        min-height: 56px;
+        min-width: 56px;
+        padding: 0.65em 1.0em;
+        font-size: 1.15em;
+        line-height: 1;
+        touch-action: manipulation;
+        -webkit-tap-highlight-color: transparent;
+        user-select: none;
+        -webkit-user-select: none;
+    }
+
+    /* Mobile-friendly fave star: bigger hit area + better alignment */
+    #faveStar{
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 56px;
+        min-width: 56px;
+        padding: 0 12px;
+        font-size: 1.6em;
+        line-height: 1;
+        touch-action: manipulation;
+        -webkit-tap-highlight-color: transparent;
+        user-select: none;
+        -webkit-user-select: none;
+        border: 1px solid #d0d7de;
+        border-radius: 10px;
+        background: #fff;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.08);
+    }
+
+    #faveStar:active{
+        background: #f8f9fa;
+    }
 }
 
 /* DataTables Styling */
@@ -328,4 +424,184 @@ span.share-link-feedback {
     border-radius: 4px; 
     padding: 2px 8px; 
     font-size: 0.95em; 
+}
+
+/* Bookmarks DataTable Styling */
+#bookmarksTable {
+    background: #fff;
+    border-radius: 8px;
+    width: 100% !important;
+}
+
+#bookmarksTable th {
+    background: #2c3e50;
+    color: white;
+    font-weight: bold;
+    padding: 10px 12px;
+}
+
+#bookmarksTable td {
+    padding: 8px 12px;
+    border-bottom: 1px solid #eee;
+}
+
+#bookmarksTable tbody tr:hover {
+    background: #f8f9fa;
+}
+
+#bookmarksContent .dataTables_wrapper {
+    padding: 0;
+}
+
+#bookmarksContent .dataTables_filter {
+    margin-bottom: 10px;
+}
+
+#bookmarksContent .dataTables_filter input {
+    border: 1px solid #d0d7de;
+    border-radius: 6px;
+    padding: 6px 10px;
+    margin-left: 5px;
+}
+
+#bookmarksContent .dataTables_length {
+    margin-bottom: 10px;
+}
+
+#bookmarksContent .dataTables_length select {
+    border: 1px solid #d0d7de;
+    border-radius: 6px;
+    padding: 4px 8px;
+    margin: 0 5px;
+}
+
+#bookmarksContent .dataTables_info {
+    color: #666;
+    font-size: 0.9em;
+    padding-top: 10px;
+}
+
+#bookmarksContent .dataTables_paginate {
+    padding-top: 10px;
+}
+
+#bookmarksContent .dataTables_paginate .paginate_button {
+    background: #fff;
+    border: 1px solid #ddd;
+    color: #2980b9 !important;
+    font-weight: bold;
+    padding: 5px 10px;
+    margin: 0 2px;
+    border-radius: 4px;
+    cursor: pointer;
+}
+
+#bookmarksContent .dataTables_paginate .paginate_button:hover {
+    background: #2980b9;
+    color: white !important;
+    border-color: #2980b9;
+}
+
+#bookmarksContent .dataTables_paginate .paginate_button.current {
+    background: #2980b9;
+    color: white !important;
+    border-color: #2980b9;
+}
+
+#bookmarksContent .dataTables_paginate .paginate_button.disabled {
+    color: #999 !important;
+    cursor: default;
+}
+
+#bookmarksContent .dataTables_paginate .paginate_button.disabled:hover {
+    background: #fff;
+    color: #999 !important;
+    border-color: #ddd;
+}
+
+#bookmarksContent .bookmark-link {
+    color: #2980b9;
+    font-weight: bold;
+    text-decoration: none;
+}
+
+#bookmarksContent .bookmark-link:hover {
+    text-decoration: underline;
+}
+
+/* Login Required Screen */
+#loginRequired {
+    background: #fff;
+    border-radius: 16px;
+    box-shadow: 0 8px 32px rgba(44, 62, 80, 0.15);
+    padding: 3em;
+    max-width: 400px;
+    margin: 0 auto;
+}
+
+#loginRequired h1 {
+    color: #2c3e50;
+    margin-bottom: 0.5em;
+}
+
+#loginRequired p {
+    color: #666;
+    margin-bottom: 1.5em;
+}
+
+/* Volume toggle button */
+.pl-btn{
+    background: #fff;
+    border: 1px solid #d0d7de;
+    border-radius: 8px;
+    padding: 0.4em 0.8em;
+    font-size: 1.1em;
+    cursor: pointer;
+    box-shadow: 0 2px 5px rgba(0,0,0,0.08);
+}
+
+.pl-btn:hover{
+    background: #f8f9fa;
+}
+
+/* Play/Pause button (keeps width stable while icon changes) */
+#playPauseButton{
+    min-width: 2.4em;
+    text-align: center;
+}
+
+/* Narrow-screen user list inside bookmarks modal */
+#bookmarksContent ul.userlist{
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+
+#bookmarksContent .userlist-item{
+    background: #fff;
+    margin: 0.5em 0;
+    padding: 0.75em 1em;
+    border-radius: 8px;
+    box-shadow: 0 2px 5px rgba(0,0,0,0.08);
+}
+
+#bookmarksContent .userlist-row{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+#bookmarksContent .userlist-link a{
+    text-decoration: none;
+}
+
+#bookmarksContent .userlist-meta{
+    margin-top: 0.5em;
+    color: #2c3e50;
+    font-weight: normal;
+}
+
+#bookmarksContent .userlist-meta > div{
+    margin-top: 4px;
 }

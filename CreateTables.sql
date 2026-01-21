@@ -17,3 +17,41 @@ CREATE TABLE `Folder` (
 	PRIMARY KEY (`FolderId`) USING BTREE
 ) 
 
+CREATE TABLE `AppUser` (
+  `UserId` INT(10) UNSIGNED ZEROFILL NOT NULL AUTO_INCREMENT,
+  `Email` VARCHAR(255) NOT NULL,
+  `DateCreated` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `LastLoginDate` DATETIME NULL DEFAULT NULL,
+  `LastFolderId` INT(10) UNSIGNED,
+  `LastTimeSeconds` INT(10) UNSIGNED,
+  `LastFileUrl` VARCHAR(300) NULL DEFAULT NULL,
+  PRIMARY KEY (`UserId`) USING BTREE
+);
+
+CREATE TABLE `UserLogin` (
+	`UserLoginId` INT(10) UNSIGNED ZEROFILL NOT NULL AUTO_INCREMENT,
+	`UserId` INT(10) UNSIGNED ZEROFILL NOT NULL,
+	`LoginDate` DATETIME NOT NULL,
+	`IpAddress` VARCHAR(200) NOT NULL,
+	PRIMARY KEY (`UserLoginId`) USING BTREE,
+	KEY `IX_UserLogin_UserId_LoginDate` (`UserId`, `LoginDate`) USING BTREE,
+	CONSTRAINT `FK_UserLogin_AppUser` FOREIGN KEY (`UserId`) REFERENCES `AppUser`(`UserId`) ON DELETE CASCADE
+);
+
+CREATE TABLE `UserFolder` (
+	`UserId` INT(10) UNSIGNED ZEROFILL NOT NULL,
+	`FolderId` INT(10) UNSIGNED ZEROFILL NOT NULL,	
+	`Rating` DOUBLE NOT NULL,
+	`IsFave` BIT(1) NOT NULL DEFAULT b'0',
+	`LastTimeSeconds` INT(10) UNSIGNED NULL DEFAULT NULL,
+	`LastFileUrl` VARCHAR(300) NULL DEFAULT NULL,
+	`DateRated` DATETIME NOT NULL,		
+	PRIMARY KEY (`UserId`, `FolderId`) USING BTREE,
+	KEY `IX_UserFolder_UserId_IsFave` (`UserId`, `IsFave`) USING BTREE,
+	FOREIGN KEY (`UserId`) REFERENCES `AppUser`(`UserId`) ON DELETE CASCADE,
+	FOREIGN KEY (`FolderId`) REFERENCES `Folder`(`FolderId`) ON DELETE CASCADE
+);
+
+-- If the table already exists in your DB, apply separately:
+-- ALTER TABLE UserFolder MODIFY IsFave BIT(1) NOT NULL DEFAULT b'0';
+-- CREATE INDEX IX_UserFolder_UserId_IsFave ON UserFolder(UserId, IsFave);
