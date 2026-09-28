@@ -13,6 +13,14 @@ $DB_PASS = $config['DB_PASS'];
 
 $GOOGLE_CLIENT_ID = getenv('GOOGLE_CLIENT_ID') ?: ($config['GOOGLE_CLIENT_ID'] ?? '');
 
+// Optional: list of emails allowed to edit the shared book metadata (title, URL, author, ...).
+// Leave empty / unset in config.php to keep the old behavior (every logged-in user can edit).
+// Every user can always set their own rating.
+$ADMIN_EMAILS = array_map('strtolower', array_map('trim', (array)($config['ADMIN_EMAILS'] ?? [])));
+
+// Folder names that are never shown in listings.
+const HIDDEN_FOLDER_NAMES = ['images', 'bin', 'obj', '.vs'];
+
 // Check if user is authenticated
 $isAuthenticated = isset($_SESSION['user']) && is_array($_SESSION['user']) && (string)($_SESSION['user']['email'] ?? '') !== '';
 
@@ -24,6 +32,15 @@ function get_logged_in_user_id(): int {
     return $uid > 0 ? $uid : 0;
 }
 
+function can_edit_shared_metadata(): bool {
+    global $ADMIN_EMAILS;
+    if (count($ADMIN_EMAILS) === 0) {
+        return true;
+    }
+    $email = strtolower((string)($_SESSION['user']['email'] ?? ''));
+    return $email !== '' && in_array($email, $ADMIN_EMAILS, true);
+}
+
 function db_connect(): mysqli {
     global $DB_HOST, $DB_NAME, $DB_USER, $DB_PASS;
     $mysqli = mysqli_connect($DB_HOST, $DB_USER, $DB_PASS, $DB_NAME);
@@ -31,23 +48,183 @@ function db_connect(): mysqli {
     return $mysqli;
 }
 
-function get_folder_id_for_path(mysqli $mysqli, string $folderPath): int {
-    // Folder table is keyed by FolderName (basename) in this app.
-    $folderName = basename($folderPath);
-    if ($folderName === '') {
-        return 0;
+/**
+ * Log the real error server-side and send only a generic message to the client.
+ * Both 'ok' and 'success' are set because different callers check different keys.
+ */
+function json_fail(int $status, string $publicMessage, ?Throwable $ex = null): void {
+    if ($ex !== null) {
+        error_log('[Player.php] ' . get_class($ex) . ': ' . $ex->getMessage());
+    }
+    http_response_code($status);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(['ok' => false, 'success' => false, 'error' => $publicMessage]);
+    exit;
+}
+
+/**
+ * Basic cross-site request protection for API calls: browsers send Sec-Fetch-Site on
+ * every request, and Origin on POSTs. A request coming from another site is rejected.
+ */
+function reject_cross_site_requests(): void {
+    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') {
+        return;
     }
 
-    $stmt = $mysqli->prepare('SELECT FolderId FROM Folder WHERE FolderName = ? LIMIT 1');
-    $stmt->bind_param('s', $folderName);
+    $fetchSite = strtolower((string)($_SERVER['HTTP_SEC_FETCH_SITE'] ?? ''));
+    if ($fetchSite !== '') {
+        if ($fetchSite === 'cross-site') {
+            json_fail(403, 'Cross-site request rejected');
+        }
+        return;
+    }
+
+    // Older browsers: fall back to comparing Origin with Host.
+    $origin = (string)($_SERVER['HTTP_ORIGIN'] ?? '');
+    if ($origin === '' || $origin === 'null') {
+        return;
+    }
+    $originHost = strtolower((string)parse_url($origin, PHP_URL_HOST));
+    $originPort = parse_url($origin, PHP_URL_PORT);
+    if ($originPort !== null && $originPort !== false) {
+        $originHost .= ':' . $originPort;
+    }
+    $allowed = [];
+    foreach (['HTTP_HOST', 'HTTP_X_FORWARDED_HOST'] as $key) {
+        if (!empty($_SERVER[$key])) {
+            foreach (explode(',', (string)$_SERVER[$key]) as $h) {
+                $h = strtolower(trim($h));
+                $allowed[] = $h;
+                $allowed[] = preg_replace('/:(80|443)$/', '', $h);
+            }
+        }
+    }
+    if (!in_array($originHost, $allowed, true)) {
+        json_fail(403, 'Cross-site request rejected');
+    }
+}
+
+/**
+ * Turn a client-supplied folder path into a server path that is guaranteed to be inside
+ * the app folder. Returns null if the path escapes it.
+ *
+ * The check is lexical (no realpath), so symlinks placed inside the library keep working,
+ * but '..' segments and paths outside the base folder are refused.
+ */
+function resolve_library_path(string $input): ?string {
+    $base = __DIR__;
+    $input = trim($input);
+    if ($input === '') {
+        return $base;
+    }
+    if (strpos($input, "\0") !== false) {
+        return null;
+    }
+
+    $norm = str_replace('\\', '/', $input);
+    foreach (explode('/', $norm) as $segment) {
+        if ($segment === '..' || $segment === '.') {
+            return null;
+        }
+    }
+    $norm = rtrim(preg_replace('#(?<!^)/{2,}#', '/', $norm), '/');
+    $baseNorm = rtrim(str_replace('\\', '/', $base), '/');
+
+    $isWindows = PHP_OS_FAMILY === 'Windows';
+    $same = $isWindows ? (strcasecmp($norm, $baseNorm) === 0) : ($norm === $baseNorm);
+    if ($same) {
+        return $base;
+    }
+
+    $prefix = $baseNorm . '/';
+    $hasPrefix = $isWindows
+        ? (strncasecmp($norm, $prefix, strlen($prefix)) === 0)
+        : (strncmp($norm, $prefix, strlen($prefix)) === 0);
+    if (!$hasPrefix) {
+        return null;
+    }
+
+    // Rebuild from the canonical base so the returned path always starts with __DIR__ exactly.
+    $rest = substr($norm, strlen($prefix));
+    return $base . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $rest);
+}
+
+function path_key(?string $s): string {
+    $s = str_replace('\\', '/', (string)$s);
+    $s = rtrim($s, '/');
+    return mb_strtolower($s, 'UTF-8');
+}
+
+/**
+ * Look up Folder rows (plus this user's rating) for many paths in ONE query.
+ *
+ * Match rules:
+ *  1. Exact FolderPath match.
+ *  2. Otherwise, fall back to FolderName (the folder's basename) but only when exactly one
+ *     row has that name AND that row is not owned by another folder that still exists on
+ *     disk. This keeps old rows (saved before paths were used as the key) working, without
+ *     two different "Book 1" folders sharing the same row.
+ *
+ * Returns [inputPath => row]; paths with no match are absent.
+ */
+function find_folder_rows(mysqli $mysqli, array $paths, int $userId = 0): array {
+    $paths = array_values(array_unique(array_filter($paths, function ($p) { return (string)$p !== ''; })));
+    if (count($paths) === 0) {
+        return [];
+    }
+
+    $names = array_values(array_unique(array_map('basename', $paths)));
+    $pathMarks = implode(',', array_fill(0, count($paths), '?'));
+    $nameMarks = implode(',', array_fill(0, count($names), '?'));
+
+    $sql = "
+        SELECT f.FolderId, f.FolderPath, f.FolderName, f.BookName, f.Url, f.RateCount, f.Rate,
+               NULLIF(uf.Rating, 0) AS MyRate, f.Author, f.Category,
+               YEAR(f.PublicationDate) AS PubYear, f.PublicationDate
+        FROM Folder f
+        LEFT JOIN UserFolder uf ON uf.FolderId = f.FolderId AND uf.UserId = ?
+        WHERE f.FolderPath IN ($pathMarks) OR f.FolderName IN ($nameMarks)
+        ORDER BY f.FolderId
+    ";
+    $stmt = $mysqli->prepare($sql);
+    $params = array_merge([$userId], $paths, $names);
+    $types = 'i' . str_repeat('s', count($paths) + count($names));
+    $stmt->bind_param($types, ...$params);
     $stmt->execute();
-    $stmt->bind_result($folderId);
-    $id = 0;
-    if ($stmt->fetch()) {
-        $id = (int)$folderId;
+    $res = $stmt->get_result();
+
+    $byPath = [];
+    $byName = [];
+    while ($row = $res->fetch_assoc()) {
+        $pk = path_key($row['FolderPath']);
+        if ($pk !== '' && !isset($byPath[$pk])) {
+            $byPath[$pk] = $row;
+        }
+        $byName[mb_strtolower((string)$row['FolderName'], 'UTF-8')][] = $row;
     }
     $stmt->close();
-    return $id;
+
+    $out = [];
+    foreach ($paths as $p) {
+        $pk = path_key($p);
+        if (isset($byPath[$pk])) {
+            $out[$p] = $byPath[$pk];
+            continue;
+        }
+        $candidates = $byName[mb_strtolower(basename($p), 'UTF-8')] ?? [];
+        if (count($candidates) === 1) {
+            $storedPath = (string)($candidates[0]['FolderPath'] ?? '');
+            if ($storedPath === '' || !is_dir($storedPath)) {
+                $out[$p] = $candidates[0];
+            }
+        }
+    }
+    return $out;
+}
+
+function get_folder_id_for_path(mysqli $mysqli, string $folderPath): int {
+    $rows = find_folder_rows($mysqli, [$folderPath]);
+    return isset($rows[$folderPath]) ? (int)$rows[$folderPath]['FolderId'] : 0;
 }
 
 function get_folder_path_for_id(mysqli $mysqli, int $folderId): string {
@@ -66,89 +243,41 @@ function get_folder_path_for_id(mysqli $mysqli, int $folderId): string {
     return $path;
 }
 
-function setFolderInfo($folderPath, &$folderObject, $userId = 0) {
-    // Use MySQL database instead of reading from files
-    global $DB_HOST, $DB_NAME, $DB_USER, $DB_PASS;
-    $host = $DB_HOST;
-    $db = $DB_NAME;
-    $user = $DB_USER;
-    $pass = $DB_PASS;
-
-    // Extract folder name from path
-    $folderName = basename($folderPath);
-
-    $mysqli = null;
-    try {
-        $mysqli = mysqli_connect($host, $user, $pass, $db);
-        
-        if ($userId > 0) {
-            // Join with UserFolder to get user's rating
-            $stmt = $mysqli->prepare("
-                SELECT f.BookName, f.Url, f.RateCount, f.Rate, uf.Rating AS MyRate, f.Author, f.Category, 
-                       YEAR(f.PublicationDate) AS PubYear, f.PublicationDate 
-                FROM Folder f
-                LEFT JOIN UserFolder uf ON uf.FolderId = f.FolderId AND uf.UserId = ?
-                WHERE f.FolderName = ? 
-                LIMIT 1
-            ");
-            $stmt->bind_param('is', $userId, $folderName);
-        } else {
-            // No user logged in, don't fetch user rating
-            $stmt = $mysqli->prepare("
-                SELECT BookName, Url, RateCount, Rate, NULL AS MyRate, Author, Category, 
-                       YEAR(PublicationDate) AS PubYear, PublicationDate 
-                FROM Folder 
-                WHERE FolderName = ? 
-                LIMIT 1
-            ");
-            $stmt->bind_param('s', $folderName);
-        }
-        
-        $stmt->execute();
-        $stmt->bind_result($title, $url, $rateCount, $rate, $myRate, $Author, $Category, $PubYear, $PubDate);
-        if ($stmt->fetch()) {
-            $folderObject['TitleUrl'] = encodeText($url);
-            $folderObject['Title'] = encodeText($title);
-            $folderObject['MyRating'] = $myRate !== null ? $myRate . "" : "";
-            $folderObject['TitleRating'] = is_numeric($rate) ? round($rate, 1) . "" : $rate . "";
-            $folderObject['RateCount'] = $rateCount . "";
-            $folderObject['Author'] = encodeText($Author . "");
-            $folderObject['Category'] = encodeText($Category . "");
-            $folderObject['PubYear'] = $PubYear . "";
-            $folderObject['PubDate'] = $PubDate . "";
-        }
-        $stmt->close();
-    } catch (mysqli_sql_exception $e) {
-        // Optionally log error or handle as needed
-    } finally {
-        if ($mysqli) {
-            mysqli_close($mysqli);
-        }
-    }
+function apply_folder_info(array $row, array &$folderObject): void {
+    $url = (string)($row['Url'] ?? '');
+    $rate = $row['Rate'];
+    $folderObject['TitleUrl'] = encodeText($url);
+    $folderObject['Title'] = encodeText((string)($row['BookName'] ?? ''));
+    $folderObject['MyRating'] = $row['MyRate'] !== null ? $row['MyRate'] . "" : "";
+    $folderObject['TitleRating'] = is_numeric($rate) ? round((float)$rate, 1) . "" : (string)$rate;
+    $folderObject['RateCount'] = (string)($row['RateCount'] ?? '');
+    $folderObject['Author'] = encodeText((string)($row['Author'] ?? ''));
+    $folderObject['Category'] = encodeText((string)($row['Category'] ?? ''));
+    $folderObject['PubYear'] = (string)($row['PubYear'] ?? '');
+    $folderObject['PubDate'] = (string)($row['PublicationDate'] ?? '');
 }
 
 function encodeText($s) {
-    if ($s == null || $s == "") { 
+    if ($s == null || $s == "") {
         return "";
     } else {
-        // First try to detect the current encoding
+        // Database strings are already UTF-8 (connection uses utf8mb4); this mainly matters
+        // for file and folder names coming from the filesystem.
         $encoding = mb_detect_encoding($s, ['UTF-8', 'ISO-8859-1', 'Windows-1252'], true);
         if ($encoding === false) {
-            // If detection fails, assume it's already UTF-8 or try to clean it
             return mb_convert_encoding($s, 'UTF-8', 'UTF-8');
         } else {
-            // Convert from detected encoding to UTF-8
             return mb_convert_encoding($s, 'UTF-8', $encoding);
         }
     }
 }
 
 function ensure_userfolder_row(mysqli $mysqli, int $userId, int $folderId): void {
-    // Ensure a row exists so we can store IsFave even if no rating was made.
-    // Use neutral defaults for required columns.
+    // Ensure a row exists so we can store IsFave / progress even if no rating was made.
+    // Rating stays NULL until the user actually rates (requires Migration.sql).
     $stmt = $mysqli->prepare('
         INSERT INTO UserFolder (UserId, FolderId, Rating, IsFave, DateRated)
-        VALUES (?, ?, 0, b\'0\', NOW())
+        VALUES (?, ?, NULL, b\'0\', NULL)
         ON DUPLICATE KEY UPDATE UserId = UserId
     ');
     $stmt->bind_param('ii', $userId, $folderId);
@@ -156,11 +285,9 @@ function ensure_userfolder_row(mysqli $mysqli, int $userId, int $folderId): void
     $stmt->close();
 }
 
-// NEW: upsert per-folder progress
 function upsert_userfolder_progress(mysqli $mysqli, int $userId, int $folderId, int $timeSeconds, string $fileUrl): void {
     if ($userId <= 0 || $folderId <= 0) return;
 
-    // Ensure row exists so UPDATE always works
     ensure_userfolder_row($mysqli, $userId, $folderId);
 
     $stmt = $mysqli->prepare('
@@ -173,20 +300,38 @@ function upsert_userfolder_progress(mysqli $mysqli, int $userId, int $folderId, 
     $stmt->close();
 }
 
+/** Resolve the folderPath parameter for endpoints that only look it up in the DB. */
+function require_folder_param(string $raw): string {
+    if ($raw === '') {
+        json_fail(400, 'Missing folderPath');
+    }
+    $path = resolve_library_path($raw);
+    if ($path === null) {
+        json_fail(400, 'Invalid folderPath');
+    }
+    return $path;
+}
+
 $mode = $_REQUEST['mode'] ?? '';
 
 // Require authentication for all API modes except authStatus
 if ($mode !== '' && $mode !== 'authStatus' && !$isAuthenticated) {
-    http_response_code(401);
-    header('Content-Type: application/json');
-    echo json_encode(['ok' => false, 'error' => 'Authentication required']);
-    exit;
+    json_fail(401, 'Authentication required');
+}
+
+if ($mode !== '') {
+    reject_cross_site_requests();
 }
 
 if ($mode === 'json') {
-    $folderPath = $_POST['folderPath'] ?? '';
-    $baseFolder = dirname(__FILE__);
+    $baseFolder = __DIR__;
     $userId = get_logged_in_user_id();
+
+    // Anything outside the app folder (or not a directory) falls back to the root.
+    $folderPath = resolve_library_path((string)($_POST['folderPath'] ?? ''));
+    if ($folderPath === null || !is_dir($folderPath)) {
+        $folderPath = $baseFolder;
+    }
 
     $result = [
         "CurrentPath" => encodeText($folderPath),
@@ -205,89 +350,107 @@ if ($mode === 'json') {
     ];
 
     try {
-        if (!is_dir($folderPath)) {
-            $folderPath = $baseFolder;
-            $result['CurrentPath'] = encodeText($folderPath);
-        } else {
-            if (strlen($folderPath) > strlen($baseFolder)) {
-                $rel = substr($folderPath, strlen($baseFolder) + 1);
-                $result['CurrentFolder'] = encodeText(PHP_OS_FAMILY === 'Windows' ? str_replace("\\", "/", $rel) : $rel);
+        if (strlen($folderPath) > strlen($baseFolder)) {
+            $rel = substr($folderPath, strlen($baseFolder) + 1);
+            $result['CurrentFolder'] = encodeText(PHP_OS_FAMILY === 'Windows' ? str_replace("\\", "/", $rel) : $rel);
+        }
+
+        $subfolderObjects = [];
+        $subfolders = array_filter(glob($folderPath . '/*') ?: [], 'is_dir');
+
+        foreach ($subfolders as $subfolder) {
+            if (in_array(basename($subfolder), HIDDEN_FOLDER_NAMES, true)) {
+                continue;
+            }
+
+            $hasSubfolders = count(array_filter(glob($subfolder . '/*') ?: [], 'is_dir')) > 0;
+            $hasMp3 = count(glob($subfolder . '/*.mp3') ?: []) > 0;
+
+            if ($hasSubfolders || $hasMp3) {
+                $normalizedPath = (PHP_OS_FAMILY === 'Windows') ? str_replace('/', '\\', $subfolder) : $subfolder;
+                $subfolderObjects[$normalizedPath] = [
+                    "Folder" => encodeText($normalizedPath),
+                    "Title" => "",
+                    "TitleUrl" => "",
+                    "TitleRating" => "",
+                    "MyRating" => "",
+                    "RateCount" => "",
+                    "Author" => "",
+                    "Category" => "",
+                    "PubYear" => "",
+                    "PubDate" => ""
+                ];
             }
         }
 
-        if (is_dir($folderPath)) {
-            $subfolders = array_filter(glob($folderPath . '/*'), 'is_dir');
+        if (count($subfolderObjects) === 0) {
+            $files = array_merge(
+                glob($folderPath . '/*.mp3') ?: [],
+                glob($folderPath . '/*.pdf') ?: [],
+                glob($folderPath . '/*.txt') ?: []
+            );
 
-            foreach ($subfolders as $subfolder) {
-                $hasSubfolders = count(array_filter(glob($subfolder . '/*'), 'is_dir')) > 0;
-                $hasMp3 = count(glob($subfolder . '/*.mp3')) > 0;
-
-                if ($hasSubfolders || $hasMp3) {
-                    $normalizedPath = (PHP_OS_FAMILY === 'Windows') ? str_replace('/', '\\', $subfolder) : $subfolder;
-
-                    $folderObject = [
-                        "Folder" => encodeText($normalizedPath),
-                        "Title" => "",
-                        "TitleUrl" => "",
-                        "TitleRating" => "",
-                        "MyRating" => "",
-                        "RateCount" => "",
-                        "Author" => "",
-                        "Category" => "",
-                        "PubYear" => "",
-                        "PubDate" => ""
-                    ];
-
-                    setFolderInfo($subfolder, $folderObject, $userId);
-                    $result['Subfolders'][] = $folderObject;
+            $webPaths = [];
+            foreach ($files as $file) {
+                $sFileName = strtolower(basename($file));
+                if ($sFileName !== 'index.txt' && $sFileName !== 'rating.txt') {
+                    $rel = substr($file, strlen($folderPath));
+                    $rel = ltrim($rel, DIRECTORY_SEPARATOR . '/');
+                    $rel = str_replace(['\\', '/'], '/', $rel); // Normalize for web
+                    $webPaths[] = encodeText($rel);
                 }
             }
-
-            if (count($result['Subfolders']) === 0) {
-                $files = array_merge(
-                    glob($folderPath . '/*.mp3'),
-                    glob($folderPath . '/*.pdf'),
-                    glob($folderPath . '/*.txt')
-                );
-
-                $webPaths = [];
-                foreach ($files as $file) {
-                    $sFileName = strtolower(basename($file));
-                    if ($sFileName !== 'index.txt' && $sFileName !== 'rating.txt') {
-                        $rel = substr($file, strlen($folderPath));
-                        $rel = ltrim($rel, DIRECTORY_SEPARATOR . '/');
-                        $rel = str_replace(['\\', '/'], '/', $rel); // Normalize for web
-                        $webPaths[] = encodeText($rel);
-                    }
-                }
-
-                $result['Mp3Files'] = $webPaths;
-                setFolderInfo($folderPath, $result, $userId);
-            }
+            $result['Mp3Files'] = $webPaths;
         }
 
-        header('Content-Type: application/json');
+        // One connection, one query for the current folder and all its subfolders.
+        // A database problem only means no metadata; the listing itself still works.
+        $mysqli = null;
+        try {
+            $mysqli = db_connect();
+            $rows = find_folder_rows($mysqli, array_merge([$folderPath], array_keys($subfolderObjects)), $userId);
 
+            if (isset($rows[$folderPath])) {
+                apply_folder_info($rows[$folderPath], $result);
+            }
+            foreach ($subfolderObjects as $path => &$obj) {
+                if (isset($rows[$path])) {
+                    apply_folder_info($rows[$path], $obj);
+                }
+            }
+            unset($obj);
+        } catch (Throwable $dbEx) {
+            error_log('[Player.php] folder info lookup failed: ' . $dbEx->getMessage());
+        } finally {
+            if ($mysqli) mysqli_close($mysqli);
+        }
+
+        $result['Subfolders'] = array_values($subfolderObjects);
+
+        header('Content-Type: application/json; charset=utf-8');
         $json = json_encode($result);
         if ($json === false) {
-            echo json_encode(["error" => "JSON encoding failed: " . json_last_error_msg()]);
+            error_log('[Player.php] JSON encoding failed: ' . json_last_error_msg());
+            echo json_encode(["error" => "Could not encode the folder listing."]);
         } else {
             echo $json;
         }
-
         exit;
-    } catch (Exception $ex) {
+    } catch (Throwable $ex) {
+        error_log('[Player.php] ' . $ex->getMessage());
         http_response_code(500);
-        echo json_encode(["error" => "Server error: " . str_replace('"', "'", $ex->getMessage())]);
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode(["error" => "Server error while reading the folder."]);
         exit;
     }
 
 } elseif ($mode === 'basepath') {
-    echo json_encode(["basePath" => encodeText(dirname(__FILE__)), "OS" => PHP_OS_FAMILY]);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(["basePath" => encodeText(__DIR__), "OS" => PHP_OS_FAMILY]);
     exit;
 
 } elseif ($mode === 'authStatus') {
-    header('Content-Type: application/json');
+    header('Content-Type: application/json; charset=utf-8');
     $userEmail = '';
     if (isset($_SESSION['user']) && is_array($_SESSION['user'])) {
         $userEmail = (string)($_SESSION['user']['email'] ?? '');
@@ -302,9 +465,7 @@ if ($mode === 'json') {
     header('Content-Type: application/json; charset=utf-8');
     $userId = get_logged_in_user_id();
     if ($userId <= 0) {
-        http_response_code(401);
-        echo json_encode(['ok' => false, 'error' => 'Not authenticated']);
-        exit;
+        json_fail(401, 'Not authenticated');
     }
 
     $mysqli = null;
@@ -339,30 +500,20 @@ if ($mode === 'json') {
             'lastFileUrl' => encodeText($fileUrl)
         ]);
         exit;
-    } catch (Exception $ex) {
-        http_response_code(500);
-        echo json_encode(['ok' => false, 'error' => $ex->getMessage()]);
-        exit;
+    } catch (Throwable $ex) {
+        json_fail(500, 'Could not load progress.', $ex);
     } finally {
-        if ($mysqli) {
-            mysqli_close($mysqli);
-        }
+        if ($mysqli) mysqli_close($mysqli);
     }
 
 } elseif ($mode === 'getFolderProgress') {
     header('Content-Type: application/json; charset=utf-8');
     $userId = get_logged_in_user_id();
     if ($userId <= 0) {
-        http_response_code(401);
-        echo json_encode(['ok' => false, 'error' => 'Not authenticated']);
-        exit;
+        json_fail(401, 'Not authenticated');
     }
 
-    $folderPath = (string)($_GET['folderPath'] ?? '');
-    if ($folderPath === '') {
-        echo json_encode(['ok' => false, 'error' => 'Missing folderPath']);
-        exit;
-    }
+    $folderPath = require_folder_param((string)($_GET['folderPath'] ?? ''));
 
     $mysqli = null;
     try {
@@ -398,10 +549,8 @@ if ($mode === 'json') {
             'lastFileUrl' => encodeText($fileUrl)
         ]);
         exit;
-    } catch (Exception $ex) {
-        http_response_code(500);
-        echo json_encode(['ok' => false, 'error' => $ex->getMessage()]);
-        exit;
+    } catch (Throwable $ex) {
+        json_fail(500, 'Could not load progress.', $ex);
     } finally {
         if ($mysqli) mysqli_close($mysqli);
     }
@@ -410,18 +559,16 @@ if ($mode === 'json') {
     header('Content-Type: application/json; charset=utf-8');
     $userId = get_logged_in_user_id();
     if ($userId <= 0) {
-        http_response_code(401);
-        echo json_encode(['ok' => false, 'error' => 'Not authenticated']);
-        exit;
+        json_fail(401, 'Not authenticated');
     }
 
-    $folderPath = (string)($_POST['folderPath'] ?? '');
-    $timeSeconds = (int)($_POST['timeSeconds'] ?? 0);
-    $fileUrl = (string)($_POST['fileUrl'] ?? '');
-
-    if ($timeSeconds < 0) {
-        $timeSeconds = 0;
+    $rawFolderPath = (string)($_POST['folderPath'] ?? '');
+    $folderPath = $rawFolderPath === '' ? '' : resolve_library_path($rawFolderPath);
+    if ($folderPath === null) {
+        json_fail(400, 'Invalid folderPath');
     }
+    $timeSeconds = max(0, (int)($_POST['timeSeconds'] ?? 0));
+    $fileUrl = mb_substr((string)($_POST['fileUrl'] ?? ''), 0, 2000);
 
     $mysqli = null;
     try {
@@ -439,115 +586,121 @@ if ($mode === 'json') {
             $stmt = $mysqli->prepare('UPDATE AppUser SET LastTimeSeconds = ?, LastFileUrl = ? WHERE UserId = ?');
             $stmt->bind_param('isi', $timeSeconds, $fileUrl, $userId);
         }
-
         $stmt->execute();
         $stmt->close();
 
-        // ALSO save per-folder progress (only when folder is known)
+        // Also save per-folder progress (only when folder is known)
         if ($folderId > 0) {
             upsert_userfolder_progress($mysqli, $userId, $folderId, $timeSeconds, $fileUrl);
         }
 
         echo json_encode(['ok' => true, 'lastFolderId' => $folderId, 'lastTimeSeconds' => $timeSeconds, 'lastFileUrl' => encodeText($fileUrl)]);
         exit;
-    } catch (Exception $ex) {
-        http_response_code(500);
-        echo json_encode(['ok' => false, 'error' => $ex->getMessage()]);
-        exit;
+    } catch (Throwable $ex) {
+        json_fail(500, 'Could not save progress.', $ex);
     } finally {
-        if ($mysqli) {
-            mysqli_close($mysqli);
-        }
+        if ($mysqli) mysqli_close($mysqli);
     }
 
 } elseif ($mode === 'updateFolder') {
-    $folderPath = $_POST['folderPath'] ?? '';
-    $title = $_POST['title'] ?? '';
-    $titleUrl = $_POST['titleUrl'] ?? '';
-    $myRating = $_POST['myRating'] ?? '';
-    $rate = $_POST['rate'] ?? '';
-    $rateCount = $_POST['rateCount'] ?? '';
-    $author = $_POST['author'] ?? '';
-    $category = $_POST['category'] ?? '';
-    $publicationDate = $_POST['publicationDate'] ?? '';
+    header('Content-Type: application/json; charset=utf-8');
+    $userId = get_logged_in_user_id();
+
+    $folderPath = resolve_library_path((string)($_POST['folderPath'] ?? ''));
+    if ($folderPath === null || $folderPath === __DIR__ || !is_dir($folderPath)) {
+        json_fail(400, 'Invalid folder.');
+    }
     $folderName = basename($folderPath);
 
-    global $DB_HOST, $DB_NAME, $DB_USER, $DB_PASS;
-    $host = $DB_HOST;
-    $db = $DB_NAME;
-    $user = $DB_USER;
-    $pass = $DB_PASS;
+    $title = trim((string)($_POST['title'] ?? ''));
+    $titleUrl = trim((string)($_POST['titleUrl'] ?? ''));
+    $myRating = (string)($_POST['myRating'] ?? '');
+    $rate = (string)($_POST['rate'] ?? '');
+    $rateCount = (string)($_POST['rateCount'] ?? '');
+    $author = trim((string)($_POST['author'] ?? ''));
+    $category = trim((string)($_POST['category'] ?? ''));
+    $publicationDate = trim((string)($_POST['publicationDate'] ?? ''));
 
-    $userId = get_logged_in_user_id();
+    // Validation (the URL check also blocks javascript: links from being stored).
+    if ($titleUrl !== '' && !preg_match('#^https?://#i', $titleUrl)) {
+        json_fail(400, 'Title URL must start with http:// or https://');
+    }
+    if ($publicationDate !== '' && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $publicationDate)) {
+        json_fail(400, 'Publication date must be in YYYY-MM-DD format.');
+    }
+
+    $myRatingForDb = (is_numeric($myRating) && (float)$myRating > 0 && (float)$myRating <= 5) ? (float)$myRating : null;
+    $rateForDb = is_numeric($rate) ? (float)$rate : null;
+    $rateCountForDb = is_numeric($rateCount) ? (int)$rateCount : null;
+    $publicationDateForDb = ($publicationDate !== '') ? $publicationDate : null;
+    $canEditShared = can_edit_shared_metadata();
 
     $mysqli = null;
     try {
-        $mysqli = mysqli_connect($host, $user, $pass, $db);
-        // Check if record exists
-        $stmt = $mysqli->prepare("SELECT FolderId, COUNT(*) as cnt FROM Folder WHERE FolderName = ? GROUP BY FolderId");
-        $stmt->bind_param('s', $folderName);
-        $stmt->execute();
-        $stmt->bind_result($folderId, $count);
-        $found = $stmt->fetch();
-        $stmt->close();
+        $mysqli = db_connect();
+        $mysqli->begin_transaction();
 
-        $myRatingForDb = (is_numeric($myRating) && $myRating !== '') ? (float)$myRating : null;
-        $rateForDb = (is_numeric($rate) && $rate !== '') ? $rate : null;
-        $rateCountForDb = (is_numeric($rateCount) && $rateCount !== '') ? $rateCount : null;
-        $publicationDateForDb = ($publicationDate !== '') ? $publicationDate : null; //2000-12-08
-        
-        if ($found && $count > 0) {
-            $stmt = $mysqli->prepare("UPDATE Folder SET FolderPath=?, BookName=?, Url=?, Rate=?, RateCount=?, Author=?, Category=?, PublicationDate=?, UrlUpdated=NULL WHERE FolderName=?");
-            $stmt->bind_param('ssssissss', $folderPath, $title, $titleUrl, $rateForDb, $rateCountForDb, $author, $category, $publicationDateForDb, $folderName);
-            $stmt->execute();
-            $stmt->close();
+        $rows = find_folder_rows($mysqli, [$folderPath]);
+        $folderId = isset($rows[$folderPath]) ? (int)$rows[$folderPath]['FolderId'] : 0;
+
+        if ($folderId > 0) {
+            if ($canEditShared) {
+                // Update by FolderId (not FolderName) so same-named folders elsewhere are untouched.
+                // FolderPath/FolderName are refreshed so a row matched by name gets its path.
+                $stmt = $mysqli->prepare("UPDATE Folder SET FolderPath=?, FolderName=?, BookName=?, Url=?, Rate=?, RateCount=?, Author=?, Category=?, PublicationDate=?, UrlUpdated=NULL WHERE FolderId=?");
+                $stmt->bind_param('ssssdisssi', $folderPath, $folderName, $title, $titleUrl, $rateForDb, $rateCountForDb, $author, $category, $publicationDateForDb, $folderId);
+                $stmt->execute();
+                $stmt->close();
+            }
         } else {
-            $stmt = $mysqli->prepare("INSERT INTO Folder (FolderPath, FolderName, BookName, Url, Rate, RateCount, Author, Category, PublicationDate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
-            $stmt->bind_param('ssssdisss', $folderPath, $folderName, $title, $titleUrl, $rateForDb, $rateCountForDb, $author, $category, $publicationDateForDb);
+            if ($canEditShared) {
+                $stmt = $mysqli->prepare("INSERT INTO Folder (FolderPath, FolderName, BookName, Url, Rate, RateCount, Author, Category, PublicationDate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+                $stmt->bind_param('ssssdisss', $folderPath, $folderName, $title, $titleUrl, $rateForDb, $rateCountForDb, $author, $category, $publicationDateForDb);
+            } else {
+                // Non-editors still need a row to attach their own rating to.
+                $stmt = $mysqli->prepare("INSERT INTO Folder (FolderPath, FolderName) VALUES (?, ?)");
+                $stmt->bind_param('ss', $folderPath, $folderName);
+            }
             $stmt->execute();
-            $folderId = $mysqli->insert_id;
+            $folderId = (int)$mysqli->insert_id;
             $stmt->close();
         }
 
-        // Save user's rating to UserFolder if user is logged in
+        // Save the user's own rating
         if ($userId > 0 && $folderId > 0) {
             ensure_userfolder_row($mysqli, $userId, $folderId);
-            
+
             if ($myRatingForDb !== null) {
                 $stmt = $mysqli->prepare("UPDATE UserFolder SET Rating = ?, DateRated = NOW() WHERE UserId = ? AND FolderId = ?");
                 $stmt->bind_param('dii', $myRatingForDb, $userId, $folderId);
             } else {
-                // Clear the rating if empty
-                $stmt = $mysqli->prepare("UPDATE UserFolder SET Rating = NULL WHERE UserId = ? AND FolderId = ?");
+                $stmt = $mysqli->prepare("UPDATE UserFolder SET Rating = NULL, DateRated = NULL WHERE UserId = ? AND FolderId = ?");
                 $stmt->bind_param('ii', $userId, $folderId);
             }
             $stmt->execute();
             $stmt->close();
         }
-        
-        mysqli_close($mysqli);
-        echo json_encode(["success" => true]);
-    } catch (Exception $ex) {
-        if ($mysqli) mysqli_close($mysqli);
-        http_response_code(500);
-        echo json_encode(["success" => false, "error" => str_replace('"', "'", $ex->getMessage())]);
 
+        $mysqli->commit();
+        echo json_encode(["success" => true, "ok" => true, "sharedSaved" => $canEditShared]);
+        exit;
+    } catch (Throwable $ex) {
+        if ($mysqli) {
+            try { $mysqli->rollback(); } catch (Throwable $ignored) {}
+        }
+        json_fail(500, 'Could not save folder info.', $ex);
+    } finally {
+        if ($mysqli) mysqli_close($mysqli);
     }
-    exit;
+
 } elseif ($mode === 'getFave') {
     header('Content-Type: application/json; charset=utf-8');
     $userId = get_logged_in_user_id();
     if ($userId <= 0) {
-        http_response_code(401);
-        echo json_encode(['ok' => false, 'error' => 'Not authenticated']);
-        exit;
+        json_fail(401, 'Not authenticated');
     }
 
-    $folderPath = (string)($_GET['folderPath'] ?? '');
-    if ($folderPath === '') {
-        echo json_encode(['ok' => false, 'error' => 'Missing folderPath']);
-        exit;
-    }
+    $folderPath = require_folder_param((string)($_GET['folderPath'] ?? ''));
 
     $mysqli = null;
     try {
@@ -576,10 +729,8 @@ if ($mode === 'json') {
 
         echo json_encode(['ok' => true, 'isFave' => $isFave]);
         exit;
-    } catch (Exception $ex) {
-        http_response_code(500);
-        echo json_encode(['ok' => false, 'error' => $ex->getMessage()]);
-        exit;
+    } catch (Throwable $ex) {
+        json_fail(500, 'Could not load bookmark state.', $ex);
     } finally {
         if ($mysqli) mysqli_close($mysqli);
     }
@@ -588,18 +739,11 @@ if ($mode === 'json') {
     header('Content-Type: application/json; charset=utf-8');
     $userId = get_logged_in_user_id();
     if ($userId <= 0) {
-        http_response_code(401);
-        echo json_encode(['ok' => false, 'error' => 'Not authenticated']);
-        exit;
+        json_fail(401, 'Not authenticated');
     }
 
-    $folderPath = (string)($_POST['folderPath'] ?? '');
+    $folderPath = require_folder_param((string)($_POST['folderPath'] ?? ''));
     $isFave = (int)($_POST['isFave'] ?? 0) ? 1 : 0;
-
-    if ($folderPath === '') {
-        echo json_encode(['ok' => false, 'error' => 'Missing folderPath']);
-        exit;
-    }
 
     $mysqli = null;
     try {
@@ -623,99 +767,45 @@ if ($mode === 'json') {
 
         echo json_encode(['ok' => true, 'isFave' => ($isFave === 1)]);
         exit;
-    } catch (Exception $ex) {
-        http_response_code(500);
-        echo json_encode(['ok' => false, 'error' => $ex->getMessage()]);
-        exit;
+    } catch (Throwable $ex) {
+        json_fail(500, 'Could not save bookmark.', $ex);
     } finally {
         if ($mysqli) mysqli_close($mysqli);
     }
 
-} elseif ($mode === 'getBookmarks') {
+} elseif ($mode === 'getBookmarks' || $mode === 'getRatings') {
     header('Content-Type: application/json; charset=utf-8');
     $userId = get_logged_in_user_id();
     if ($userId <= 0) {
-        http_response_code(401);
-        echo json_encode(['ok' => false, 'error' => 'Not authenticated']);
-        exit;
+        json_fail(401, 'Not authenticated');
     }
+
+    $isBookmarks = ($mode === 'getBookmarks');
+    $where = $isBookmarks
+        ? 'uf.IsFave = 1'
+        : 'uf.Rating IS NOT NULL AND uf.Rating > 0'; // > 0 hides placeholder rows from before Migration.sql
 
     $mysqli = null;
     try {
         $mysqli = db_connect();
 
         $stmt = $mysqli->prepare("
-            SELECT f.FolderId, f.FolderPath, uf.Rating as MyRating, 
-                   IFNULL(f.BookName, f.FolderName) AS BookName, f.Author, f.Rate, f.RateCount,
-                   SUBSTRING_INDEX(REPLACE(REPLACE(f.FolderPath,'/','\\\\'), CONCAT('\\\\', f.FolderName), ''), '\\\\', -1) AS ParentName, 
-                   f.Url
-            FROM UserFolder uf
-                JOIN Folder f ON f.FolderId = uf.FolderId	
-            WHERE uf.IsFave = 1
-                AND uf.UserId = ?
-            ORDER BY BookName
-        ");
-        $stmt->bind_param('i', $userId);
-        $stmt->execute();
-        $result = $stmt->get_result();
-
-        $bookmarks = [];
-        while ($row = $result->fetch_assoc()) {
-            $bookmarks[] = [
-                'folderId' => (int)$row['FolderId'],
-                'folderPath' => encodeText($row['FolderPath']),
-                'myRating' => $row['MyRating'] !== null ? (float)$row['MyRating'] : null,
-                'bookName' => encodeText($row['BookName']),
-                'author' => encodeText($row['Author']),
-                'rate' => $row['Rate'] !== null ? (float)$row['Rate'] : null,
-                'rateCount' => $row['RateCount'] !== null ? (int)$row['RateCount'] : null,
-                'parentName' => encodeText($row['ParentName']),
-                'url' => encodeText($row['Url'])
-            ];
-        }
-        $stmt->close();
-
-        echo json_encode(['ok' => true, 'bookmarks' => $bookmarks]);
-        exit;
-    } catch (Exception $ex) {
-        http_response_code(500);
-        echo json_encode(['ok' => false, 'error' => $ex->getMessage()]);
-        exit;
-    } finally {
-        if ($mysqli) mysqli_close($mysqli);
-    }
-
-} elseif ($mode === 'getRatings') {
-    header('Content-Type: application/json; charset=utf-8');
-    $userId = get_logged_in_user_id();
-    if ($userId <= 0) {
-        http_response_code(401);
-        echo json_encode(['ok' => false, 'error' => 'Not authenticated']);
-        exit;
-    }
-
-    $mysqli = null;
-    try {
-        $mysqli = db_connect();
-
-        $stmt = $mysqli->prepare("
-            SELECT f.FolderId, f.FolderPath, uf.Rating as MyRating,
+            SELECT f.FolderId, f.FolderPath, NULLIF(uf.Rating, 0) AS MyRating,
                    IFNULL(f.BookName, f.FolderName) AS BookName, f.Author, f.Rate, f.RateCount,
                    SUBSTRING_INDEX(REPLACE(REPLACE(f.FolderPath,'/','\\\\'), CONCAT('\\\\', f.FolderName), ''), '\\\\', -1) AS ParentName,
                    f.Url
             FROM UserFolder uf
                 JOIN Folder f ON f.FolderId = uf.FolderId
-            WHERE uf.UserId = ?
-              AND uf.Rating IS NOT NULL
+            WHERE uf.UserId = ? AND $where
             ORDER BY BookName
         ");
         $stmt->bind_param('i', $userId);
         $stmt->execute();
         $result = $stmt->get_result();
 
-        $ratings = [];
+        $items = [];
         while ($row = $result->fetch_assoc()) {
-            $ratings[] = [
+            $items[] = [
                 'folderId' => (int)$row['FolderId'],
                 'folderPath' => encodeText($row['FolderPath']),
                 'myRating' => $row['MyRating'] !== null ? (float)$row['MyRating'] : null,
@@ -729,35 +819,38 @@ if ($mode === 'json') {
         }
         $stmt->close();
 
-        echo json_encode(['ok' => true, 'ratings' => $ratings]);
+        echo json_encode(['ok' => true, ($isBookmarks ? 'bookmarks' : 'ratings') => $items]);
         exit;
-    } catch (Exception $ex) {
-        http_response_code(500);
-        echo json_encode(['ok' => false, 'error' => $ex->getMessage()]);
-        exit;
+    } catch (Throwable $ex) {
+        json_fail(500, 'Could not load the list.', $ex);
     } finally {
         if ($mysqli) mysqli_close($mysqli);
     }
+
+} elseif ($mode !== '') {
+    json_fail(400, 'Unknown mode');
 }
 ?>
 
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>MP3 Player</title>
+    <meta charset="utf-8">
+    <title>Audiobooks</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#F4F6F4">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <link rel="manifest" href="manifest.json">
+    <link rel="apple-touch-icon" href="images/icon192.png">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Literata:opsz,wght@7..72,400;7..72,600&display=swap">
     <link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css">
+    <link href="Player.css?v=66" rel="stylesheet" />
     <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
     <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
-    <?php if ($isAuthenticated) { ?>
-    <script src="Player.js?v=62"></script>
-    <?php } ?>
-    <link href="Player.css?v=62" rel="stylesheet" />
-    <link rel="manifest" href="manifest.json">
-    <meta name="theme-color" content="#1976d2">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-    <link rel="apple-touch-icon" href="images/icon192.png">
+    <script src="Player.js?v=66"></script>
 
     <?php if ($GOOGLE_CLIENT_ID !== '' && !$isAuthenticated) { ?>
         <script src="https://accounts.google.com/gsi/client" async defer></script>
@@ -785,13 +878,12 @@ if ($mode === 'json') {
         </script>
     <?php } ?>
 </head>
-<body>    
+<body>
 
     <?php if (!$isAuthenticated) { ?>
-    <!-- Login Required Screen -->
-    <div id="loginRequired" style="display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 80vh; text-align: center;">
-        <h1>MP3 Player</h1>
-        <p style="margin-bottom: 20px; color: #666;">Please sign in to continue</p>
+    <main id="loginRequired">
+        <h1>Audiobooks</h1>
+        <p>Sign in to pick up where you left off.</p>
         <?php if ($GOOGLE_CLIENT_ID !== '') { ?>
             <div id="g_id_onload"
                  data-client_id="<?php echo htmlspecialchars($GOOGLE_CLIENT_ID, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?>"
@@ -804,131 +896,146 @@ if ($mode === 'json') {
                  data-shape="rectangular"
                  data-logo_alignment="left"></div>
         <?php } else { ?>
-            <p style="color: red;">Login is not configured. Please contact the administrator.</p>
+            <p class="login-error">Sign-in isn't configured yet. Add GOOGLE_CLIENT_ID to config.php.</p>
         <?php } ?>
-    </div>
+    </main>
     <?php } else { ?>
-    <!-- Authenticated User Content -->
-    <form id="form1">
-        <div id="topMenu" style="display:flex; justify-content:flex-end; align-items:center; gap:10px; margin-bottom:8px;">
-            <a href="#" id="myBookmarksLink" onclick="openBookmarksDialog(); return false;" style="font-size: 12px;">My Bookmarks</a>
-            <a href="#" id="myRatingsLink" onclick="openRatingsDialog(); return false;" style="font-size: 12px;">My Ratings</a>
-            <span style="font-size: 12px; color:#666;"><strong><?php echo htmlspecialchars((string)$_SESSION['user']['email'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?></strong></span>
-            <a href="Auth/Logout.php" style="font-size: 12px;">Log out</a>
-        </div>
+    <script>window.CAN_EDIT_SHARED = <?php echo can_edit_shared_metadata() ? 'true' : 'false'; ?>;</script>
 
-        <div id="breadcrumb" class="breadcrumb"></div>        
-        <div id="ratings"></div>
+    <!-- Icon set (referenced with <use href="#i-...">) -->
+    <svg xmlns="http://www.w3.org/2000/svg" style="display:none">
+        <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5.2v13.6a.8.8 0 0 0 1.2.7l10.6-6.8a.8.8 0 0 0 0-1.4L9.2 4.5A.8.8 0 0 0 8 5.2z" fill="currentColor"/></symbol>
+        <symbol id="i-pause" viewBox="0 0 24 24"><rect x="6" y="5" width="4.2" height="14" rx="1.2" fill="currentColor"/><rect x="13.8" y="5" width="4.2" height="14" rx="1.2" fill="currentColor"/></symbol>
+        <symbol id="i-prev" viewBox="0 0 24 24"><path d="M6.5 5.5v13" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/><path d="M18.5 6.3v11.4a.7.7 0 0 1-1.1.6L9.6 12.6a.7.7 0 0 1 0-1.2l7.8-5.7a.7.7 0 0 1 1.1.6z" fill="currentColor"/></symbol>
+        <symbol id="i-next" viewBox="0 0 24 24"><path d="M17.5 5.5v13" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/><path d="M5.5 6.3v11.4a.7.7 0 0 0 1.1.6l7.8-5.7a.7.7 0 0 0 0-1.2L6.6 5.7a.7.7 0 0 0-1.1.6z" fill="currentColor"/></symbol>
+        <symbol id="i-back30" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4.6 13.2A7.6 7.6 0 1 0 7 6.6"/><path d="M7.6 3.2 7 6.6l3.4.8"/></g><text x="12.3" y="16" text-anchor="middle" font-size="7.4" font-weight="700" font-family="system-ui, -apple-system, Segoe UI, sans-serif" fill="currentColor">30</text></symbol>
+        <symbol id="i-fwd30" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19.4 13.2A7.6 7.6 0 1 1 17 6.6"/><path d="m16.4 3.2.6 3.4-3.4.8"/></g><text x="11.7" y="16" text-anchor="middle" font-size="7.4" font-weight="700" font-family="system-ui, -apple-system, Segoe UI, sans-serif" fill="currentColor">30</text></symbol>
+        <symbol id="i-volume" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9.5h3.4L12 5.6v12.8l-4.6-3.9H4z"/><path class="wave1" d="M15.4 9.3a3.8 3.8 0 0 1 0 5.4"/><path class="wave2" d="M17.9 6.8a7.3 7.3 0 0 1 0 10.4"/></g></symbol>
+        <symbol id="i-star" viewBox="0 0 24 24"><path d="m12 3.6 2.6 5.2 5.8.9-4.2 4.1 1 5.7L12 16.8l-5.2 2.7 1-5.7-4.2-4.1 5.8-.9z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
+        <symbol id="i-link" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/></g></symbol>
+        <symbol id="i-download" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v10.5"/><path d="m7.5 10 4.5 4.5 4.5-4.5"/><path d="M5 19h14"/></g></symbol>
+        <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+        <symbol id="i-pencil" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 19.5l1-4.4L15.6 5a2.1 2.1 0 0 1 3 3L8.5 18.4z"/><path d="m13.6 7 3 3"/></g></symbol>
+        <symbol id="i-saved" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5" fill="currentColor"/><path d="M12 7.8v7.4M8.9 12.3 12 15.4l3.1-3.1" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+        <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9.5 6 6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+        <symbol id="i-external" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 5h5v5"/><path d="m19 5-8 8"/><path d="M18 14v4a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h4"/></g></symbol>
+    </svg>
 
-        <div id="playerControl" style="display:none">
-            <select id="trackSelector"></select>
-            <audio id="audioPlayer" controls></audio>
+    <header class="app-bar">
+        <a href="#" class="brand" onclick="loadFolder(basePath); return false;">Audiobooks</a>
+        <nav class="app-nav" aria-label="Account">
+            <a href="#" id="myBookmarksLink" onclick="openBookmarksDialog(); return false;">Bookmarks</a>
+            <a href="#" id="myRatingsLink" onclick="openRatingsDialog(); return false;">Ratings</a>
+            <span class="account"><?php echo htmlspecialchars((string)$_SESSION['user']['email'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?></span>
+            <a href="Auth/Logout.php">Log out</a>
+        </nav>
+    </header>
 
-            <div class="controls">
-                <button type="button" class="pl-btn" onclick="goBackSec(30)">-30</button>
-                <button type="button" class="pl-btn" onclick="goForwardSec(30)">+30</button>
-                <button type="button" class="pl-btn" onclick="cacheFolder()" id="btnCacheFolder"> Cache</button>
-                <button type="button" class="pl-btn" id="playPauseButton" title="Play/Pause">▶︎</button>
-                <button type="button" class="pl-btn" id="volumeButton" title="Volume">🔈</button>
-                <button type="button" class="pl-btn" onclick="OpenFolderDialog(false)" id="editButton" title="Volume">&#x270E;</button>
-                <button type="button" class="pl-btn" onclick="shareLink()">&#128279;</button>
+    <main class="page">
+        <nav id="breadcrumb" class="breadcrumb" aria-label="Folder path"></nav>
+        <div id="ratings" class="book-header"></div>
 
-                <span id="faveStar" title='Star this audiobook' style="cursor: pointer; margin-left: 8px; user-select: none">☆</span>
-                <span class="share-link-feedback" style="display: none">Link copied!</span>
-  
+        <section id="playerControl" class="player" style="display:none" aria-label="Player">
+            <!-- The select keeps the track order/state for the script; the chapter list is the visible picker. -->
+            <select id="trackSelector" hidden aria-hidden="true" tabindex="-1"></select>
+            <audio id="audioPlayer" preload="metadata"></audio>
+
+            <p class="np-chapter" id="npIndex"></p>
+            <h2 class="np-title" id="npTitle"></h2>
+
+            <div class="scrubber">
+                <input type="range" id="seekBar" min="0" max="1000" step="1" value="0" aria-label="Position in chapter">
+                <div class="times"><span id="timeElapsed">0:00</span><span id="timeRemaining">-0:00</span></div>
             </div>
-        </div>
+
+            <div class="transport">
+                <button type="button" class="tbtn" id="prevTrackButton" aria-label="Previous chapter" title="Previous chapter"><svg class="icon"><use href="#i-prev"/></svg></button>
+                <button type="button" class="tbtn" onclick="goBackSec(30)" aria-label="Back 30 seconds" title="Back 30 seconds"><svg class="icon icon-lg"><use href="#i-back30"/></svg></button>
+                <button type="button" class="tbtn play" id="playPauseButton" data-state="paused" aria-label="Play" title="Play">
+                    <svg class="icon i-play"><use href="#i-play"/></svg><svg class="icon i-pause"><use href="#i-pause"/></svg>
+                </button>
+                <button type="button" class="tbtn" onclick="goForwardSec(30)" aria-label="Forward 30 seconds" title="Forward 30 seconds"><svg class="icon icon-lg"><use href="#i-fwd30"/></svg></button>
+                <button type="button" class="tbtn" id="nextTrackButton" aria-label="Next chapter" title="Next chapter"><svg class="icon"><use href="#i-next"/></svg></button>
+            </div>
+
+            <div class="actions">
+                <button type="button" class="act" id="speedButton" title="Playback speed"><span class="act-icon speed-value">1×</span><span class="act-label">Speed</span></button>
+                <button type="button" class="act" id="volumeButton" data-level="0" title="Volume boost"><svg class="icon act-icon"><use href="#i-volume"/></svg><span class="act-label">Normal</span></button>
+                <button type="button" class="act" id="faveStar" aria-pressed="false" title="Bookmark this book"><svg class="icon act-icon"><use href="#i-star"/></svg><span class="act-label">Bookmark</span></button>
+                <button type="button" class="act" onclick="shareLink()" title="Copy a link to this book"><svg class="icon act-icon"><use href="#i-link"/></svg><span class="act-label">Share</span></button>
+                <button type="button" class="act" id="btnCacheFolder" onclick="cacheFolder()" title="Save all chapters for offline listening"><svg class="icon act-icon i-dl"><use href="#i-download"/></svg><svg class="icon act-icon i-done"><use href="#i-check"/></svg><span class="act-label">Download</span></button>
+                <button type="button" class="act" id="editButton" onclick="OpenFolderDialog(false)" title="Edit book info"><svg class="icon act-icon"><use href="#i-pencil"/></svg><span class="act-label">Edit</span></button>
+            </div>
+        </section>
 
         <div id="content"></div>
-    </form>
-        
+    </main>
+
+    <!-- Compact player shown when the main controls are scrolled out of view -->
+    <div id="miniPlayer" class="mini" hidden>
+        <div class="mini-progress"><span id="miniProgress"></span></div>
+        <button type="button" class="mini-info" id="miniInfo" title="Show player">
+            <span class="mini-title" id="miniTitle"></span>
+            <span class="mini-sub" id="miniSub"></span>
+        </button>
+        <button type="button" class="tbtn play small" id="miniPlayButton" data-state="paused" aria-label="Play">
+            <svg class="icon i-play"><use href="#i-play"/></svg><svg class="icon i-pause"><use href="#i-pause"/></svg>
+        </button>
+    </div>
+
+    <div class="toast share-link-feedback" role="status" style="display: none">Link copied</div>
+
     <div id="spinnerContainer" class="spinner-container"><div class="spinner"></div></div>
 
-    <dialog id="editFolderModal" style="width: 800px; position: relative; max-height: 80vh; overflow-y: auto;">
-        <div style="margin-right: 25px;">
-            <span onclick="CloseFolderDialog()" style="position: absolute; top: 10px; right: 30px; font-size: 22px; font-weight: bold; color: #888; cursor: pointer; z-index: 10;" title="Close">&times;</span>
-            <h3 id="editModalHeader">Edit Folder Info</h3>
-            <form id="editFolderForm">
-                <input type="hidden" id="editFolderPath" name="folderPath">
-                <div style="margin-bottom: 12px;">
-                    <label>Title:<br>
-                    <input type="text" id="editTitle" name="title" style="width:100%; padding: 6px;"></label>
-                </div>
-                <div style="margin-bottom: 12px;">
-                    <label>Title URL:<br>
-                    <input type="text" id="editTitleUrl" name="titleUrl" style="width:100%; padding: 6px;"></label>
-                </div>
-                <table style="width: 100%; margin-top: 15px;">
-                    <tr>
-                        <td style="width: 50%; padding-right: 10px; vertical-align: top;">
-                            <label>My Rating:<br>
-                            <select id="editMyRating" name="myRating" style="width:100%; padding: 6px;">
-                                <option value=""></option>    
-                                <option value="5.0">5.0</option>
-                                <option value="4.5">4.5</option>
-                                <option value="4.0">4.0</option>
-                                <option value="3.5">3.5</option>
-                                <option value="3.0">3.0</option>
-                                <option value="2.5">2.5</option>
-                                <option value="2.0">2.0</option>
-                                <option value="1.5">1.5</option>
-                                <option value="1.0">1.0</option>
-                            </select></label>
-                        </td>
-                        <td style="width: 50%; padding-left: 10px; vertical-align: top;">
-                            <label>Author:<br>
-                            <input type="text" id="editAuthor" name="author" style="width:100%; padding: 6px;"></label>
-                        </td>
-                    </tr>
-                    <tr>
-                        <td style="padding-right: 10px; padding-top: 12px; vertical-align: top;">
-                            <label>Public Rating:<br>
-                            <input type="number" id="editRate" name="rate" step="0.1" min="0" max="5" style="width:100%; padding: 6px;"></label>
-                        </td>
-                        <td style="padding-left: 10px; padding-top: 12px; vertical-align: top;">
-                            <label>Category:<br>
-                            <input type="text" id="editCategory" name="category" style="width:100%; padding: 6px;"></label>
-                        </td>
-                    </tr>
-                    <tr>
-                        <td style="padding-right: 10px; padding-top: 12px; vertical-align: top;">
-                            <label>Rate Count:<br>
-                            <input type="number" id="editRateCount" name="rateCount" min="0" style="width:100%; padding: 6px;"></label>
-                        </td>
-                        <td style="padding-left: 10px; padding-top: 12px; vertical-align: top;">
-                            <label>Publication Date:<br>
-                            <input type="date" id="editPublicationDate" name="publicationDate" style="width:100%; padding: 6px;"></label>
-                        </td>
-                    </tr>
-                </table>
-                <div style="text-align:right;">
-                    <button type="button" onclick="SaveFolderDialog()">Save</button>
-                    <button type="button" onclick="CloseFolderDialog()" style="background-color:gray">Cancel</button>
-                </div>
-                <div id="editFolderMsg"></div>
-            </form>
-        </div>
+    <dialog id="editFolderModal">
+        <button type="button" class="dialog-close" onclick="CloseFolderDialog()" aria-label="Close">&times;</button>
+        <h3>Edit book info</h3>
+        <p class="dialog-sub" id="editModalHeader"></p>
+        <form id="editFolderForm" onsubmit="SaveFolderDialog(); return false;">
+            <input type="hidden" id="editFolderPath" name="folderPath">
+            <label class="field wide">Title
+                <input type="text" id="editTitle" name="title"></label>
+            <label class="field wide">Book page URL
+                <input type="text" id="editTitleUrl" name="titleUrl" inputmode="url" placeholder="https://"></label>
+            <label class="field">Author
+                <input type="text" id="editAuthor" name="author"></label>
+            <label class="field">Category
+                <input type="text" id="editCategory" name="category"></label>
+            <label class="field">Public rating
+                <input type="number" id="editRate" name="rate" step="0.1" min="0" max="5"></label>
+            <label class="field">Number of ratings
+                <input type="number" id="editRateCount" name="rateCount" min="0"></label>
+            <label class="field">Published
+                <input type="date" id="editPublicationDate" name="publicationDate"></label>
+            <label class="field">My rating
+                <select id="editMyRating" name="myRating">
+                    <option value="">Not rated</option>
+                    <option value="5.0">5.0</option>
+                    <option value="4.5">4.5</option>
+                    <option value="4.0">4.0</option>
+                    <option value="3.5">3.5</option>
+                    <option value="3.0">3.0</option>
+                    <option value="2.5">2.5</option>
+                    <option value="2.0">2.0</option>
+                    <option value="1.5">1.5</option>
+                    <option value="1.0">1.0</option>
+                </select></label>
+            <div id="editFolderMsg" class="wide" role="alert"></div>
+            <div class="dialog-buttons wide">
+                <button type="button" class="btn-secondary" onclick="CloseFolderDialog()">Cancel</button>
+                <button type="submit" class="btn-primary">Save changes</button>
+            </div>
+        </form>
     </dialog>
 
     <dialog id="bookmarksModal">
-        <span onclick="closeBookmarksDialog()" style="position: absolute; top: 10px; right: 15px; font-size: 22px; font-weight: bold; color: #888; cursor: pointer; z-index: 10;" title="Close">&times;</span>
-        <h3>My Bookmarks</h3>
+        <button type="button" class="dialog-close" onclick="closeBookmarksDialog()" aria-label="Close">&times;</button>
+        <h3>Bookmarks</h3>
         <div id="bookmarksContent">
             <p>Loading...</p>
         </div>
         <div class="dialog-footer">
-            <button type="button" onclick="closeBookmarksDialog()">Close</button>
-        </div>
-    </dialog>
-
-    <dialog id="ratingsModal">
-        <span onclick="closeRatingsDialog()" style="position: absolute; top: 10px; right: 15px; font-size: 22px; font-weight: bold; color: #888; cursor: pointer; z-index: 10;" title="Close">&times;</span>
-        <h3>My Ratings</h3>
-        <div id="ratingsContent">
-            <p>Loading...</p>
-        </div>
-        <div class="dialog-footer">
-            <button type="button" onclick="closeRatingsDialog()">Close</button>
+            <button type="button" class="btn-secondary" onclick="closeBookmarksDialog()">Close</button>
         </div>
     </dialog>
     <?php } ?>

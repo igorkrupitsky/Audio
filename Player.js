@@ -14,13 +14,21 @@ const VOLUME_STEPS = [
 ];
 let volumeStepIndex = 0;
 
-// User is always authenticated when this JS loads (enforced by PHP)
-let authState = { authenticated: true, email: '' };
 // Track current fave state for current folder
 let currentIsFave = false;
 
 // Global flag to track dialog source
 let editDialogOpenedFromTable = false;
+
+// Player state
+let playerInitialized = false;   // listeners/timers registered once (see initPlayerOnce)
+let playingFolderPath = '';      // folder the loaded audio belongs to (progress is saved here)
+let pendingResumeFolder = null;  // set while a folder's saved position is still loading
+let lastSavedProgressKey = '';
+let trackLoadSeq = 0;            // ignore stale resume lookups after navigating away
+let audioLoadToken = 0;          // ignore stale setAudioFile calls
+let currentObjectUrl = null;     // blob URL of a cached track, revoked on the next switch
+let folderRequestSeq = 0;        // ignore stale folder listings (out-of-order responses)
 
 function getBasePathAndStart() {
 
@@ -58,57 +66,26 @@ function getBasePathAndStart() {
         applyVolumeStep();
     }
 
-    // NEW: Play/Pause toggle button
-    const playPauseButton = document.getElementById('playPauseButton');
-    const audio = document.getElementById('audioPlayer');
-    if (playPauseButton && audio) {
-        const setPlayPauseUI = () => {
-            // If audio isn't ready yet, default to "Play" (prevents initial out-of-sync).
-            const isReady = audio.readyState >= 1; // HAVE_METADATA
-            const isPlaying = isReady && !audio.paused && !audio.ended;
-            playPauseButton.textContent = isPlaying ? '❚❚' : '▶︎';
-            playPauseButton.title = isPlaying ? 'Pause' : 'Play';
-        };
-
-        playPauseButton.addEventListener('click', () => {
-            if (audio.paused || audio.ended) {
-                initializeAudioGain();
-                audio.play();
-            } else {
-                audio.pause();
-            }
-            // Ensure immediate UI feedback on click (even before events fire)
-            setPlayPauseUI();
-        });
-
-        audio.addEventListener('play', setPlayPauseUI);
-        audio.addEventListener('pause', setPlayPauseUI);
-        audio.addEventListener('ended', setPlayPauseUI);
-
-        // Fix initial desync: update once media becomes ready
-        audio.addEventListener('loadedmetadata', setPlayPauseUI, { once: false });
-        audio.addEventListener('canplay', setPlayPauseUI, { once: false });
-
-        // Initial state
-        setPlayPauseUI();
-    }
 }
 
 document.addEventListener('DOMContentLoaded', function () {
+    initPlayerOnce();
     getBasePathAndStart();
     setupFaveStar();
 });
 
+let shareToastTimer = null;
 function shareLink() {
-    var o = document.querySelector('span.share-link-feedback');
+    var o = document.querySelector('.share-link-feedback');
     if (o == null) return;
 
     o.style.display = "";
-    setTimeout(() => {
+    clearTimeout(shareToastTimer);
+    shareToastTimer = setTimeout(() => {
         if (o) o.style.display = "none";
-    }, 1500);
+    }, 1800);
 
-    const url = localStorage.getItem('lastFolderPath') || basePath;
+    const url = window.location.origin + window.location.pathname + '?folder=' + encodeURIComponent((currentData && currentData.CurrentPath) || localStorage.getItem('lastFolderPath') || basePath);
 
     if (navigator.clipboard) {
         navigator.clipboard.writeText(url);
@@ -140,8 +117,10 @@ function setFaveUI(isFave) {
     currentIsFave = !!isFave;
     const star = document.getElementById('faveStar');
     if (!star) return;
-    star.textContent = currentIsFave ? '★' : '☆';
-    star.title = currentIsFave ? 'Unstar this audiobook' : 'Star this audiobook';
+    star.classList.toggle('is-on', currentIsFave);
+    star.setAttribute('aria-pressed', currentIsFave ? 'true' : 'false');
+    star.title = currentIsFave ? 'Remove bookmark' : 'Bookmark this book';
+    const label = star.querySelector('.act-label');
 }
 
 async function refreshFaveUIForCurrentFolder() {
@@ -179,28 +158,34 @@ async function setFave(folderPath, isFave) {
     }
 }
 
-// Handle window resize for responsive DataTable behavior
+// Handle window resize for responsive DataTable behavior (debounced)
+let resizeTimer = null;
 window.addEventListener('resize', function () {
-    if (currentData && currentData.Subfolders.length > 0) {
-        const wasWideScreen = document.getElementById('subfoldersTable') !== null;
-        const isWideScreen = window.innerWidth > 1000;
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(function () {
+        if (currentData && currentData.Subfolders.length > 0) {
+            const wasWideScreen = document.getElementById('subfoldersTable') !== null;
+            const isWideScreen = window.innerWidth > 1000;
 
-        // Only re-render if the display mode should change
-        if (wasWideScreen !== isWideScreen) {
-            renderContent(currentData);
+            // Only re-render if the display mode should change
+            if (wasWideScreen !== isWideScreen) {
+                renderContent(currentData);
+            }
         }
-    }
+    }, 200);
 });
 
 function loadFolder(path) {
     localStorage.setItem('lastFolderPath', path);
     ShowSpinner();
+    const myRequest = ++folderRequestSeq;
 
     var xhr = new XMLHttpRequest();
     xhr.open('POST', '?mode=json', true);
     xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
     xhr.onreadystatechange = function () {
         if (xhr.readyState === 4) {
+            if (myRequest !== folderRequestSeq) return; // a newer folder was requested
             HideSpinner();
             if (xhr.status === 200) {
                 try {
@@ -229,6 +214,7 @@ function loadFolder(path) {
         }
     };
     xhr.onerror = function () {
+        if (myRequest !== folderRequestSeq) return;
         HideSpinner();
         showError('Network error');
     };
@@ -247,63 +233,74 @@ function GetMyRating(data) {
     }
 }
 
+// Page header: the current folder's title, plus author/rating/link when known.
 function renderRatings(data) {
-    if (data.Title == "") {
-        document.getElementById('ratings').innerHTML = "";
-        return;
+    const el = document.getElementById('ratings');
+    const title = data.Title || folderDisplayName(data.CurrentPath);
+    const isBook = data.Mp3Files && data.Mp3Files.length > 0;
+
+    const meta = [];
+    if (data.Author) {
+        meta.push('<span class="book-author">' + escapeHtml(data.Author) + '</span>');
     }
-
-    var html = "";
-
-    if (data.TitleRating !== "") {
-        html += " [" + data.TitleRating;
-
-        if (data.RateCount !== "") {
-            html += " - " + data.RateCount;
+    if (data.TitleRating !== "" && data.TitleRating !== undefined) {
+        let r = '<span class="book-rating"><span class="star-glyph" aria-hidden="true">★</span> ' + escapeHtml(data.TitleRating);
+        if (data.RateCount) {
+            const n = parseInt(data.RateCount, 10);
+            r += ' <span class="muted">' + escapeHtml(isNaN(n) ? data.RateCount : n.toLocaleString()) + ' ratings</span>';
         }
-
-        html += "] ";
+        meta.push(r + '</span>');
+    }
+    if (data.MyRating) {
+        meta.push('<span class="book-myrating"><span class="muted">You</span> ' + ratingImgHtml(data.MyRating) + '</span>');
+    }
+    const url = safeUrl(data.TitleUrl);
+    if (url) {
+        meta.push('<a class="book-link" href="' + escapeHtml(url) + '" target="_blank" rel="noopener noreferrer">Book page <svg class="icon icon-sm"><use href="#i-external"/></svg></a>');
     }
 
-    if (data.TitleUrl == "") {
-        html += data.Title;
-    } else {
-        html += "<a href='" + data.TitleUrl + "' target='_blank' style='text-decoration: none;'>🌐</a>";
-    }
-
-    if (data.MyRating !== "") {
-        html += " <img class='imgRate' src='" + GetRatingImg(data.MyRating) + "'>";
-    }
-
-    document.getElementById('ratings').innerHTML = html;
+    el.innerHTML = '<h1 class="page-title' + (isBook ? ' is-book' : '') + '">' + escapeHtml(title) + '</h1>'
+        + (meta.length ? '<div class="book-meta">' + meta.join('') + '</div>' : '');
+    document.title = title === 'Library' ? 'Audiobooks' : title;
 }
 
-function GetRatingImg(i) {
-    var w = parseInt(i);
-    var d = (parseFloat(i) - w) == 0 ? "0" : "5";
-    return "images/stars-" + w + "-" + d + ".gif"
+function relativeParts(path) {
+    let relative = String(path || '').replace(basePath, '');
+    relative = relative.replace(/^[\\/]+/, '');
+    return relative ? relative.split(sFolderSep) : [];
+}
+
+function folderDisplayName(path) {
+    const parts = relativeParts(path);
+    return parts.length ? parts[parts.length - 1] : 'Library';
+}
+
+// Five stars filled to the rating (CSS draws them; see .stars in Player.css)
+function ratingImgHtml(rating) {
+    let n = parseFloat(rating);
+    if (!isFinite(n)) n = 0;
+    n = Math.max(0, Math.min(5, n));
+    return '<span class="stars" style="--r:' + n + '" data-rating="' + n + '" role="img" aria-label="' + n + ' out of 5" title="' + n + ' out of 5"></span>';
 }
 
 function renderBreadcrumb(data) {
-    var relative = data.CurrentPath.replace(basePath, '');
-
-    //removes a leading backslash or forward slash
-    if (sFolderSep == "/") {
-        relative = relative.replace(/^\//, '');
-    } else {
-        relative = relative.replace(/^\\/, '');
+    const parts = relativeParts(data.CurrentPath);
+    const el = document.getElementById('breadcrumb');
+    if (parts.length === 0) {
+        el.innerHTML = '';
+        return;
     }
 
-    const parts = relative ? relative.split(sFolderSep) : [];
-    let html = '<span class="crumb" data-path="' + basePath + '">Root</span>';
+    const sep = '<svg class="icon crumb-sep" aria-hidden="true"><use href="#i-chevron"/></svg>';
+    let html = '<span class="crumb" data-path="' + escapeHtml(basePath) + '">Library</span>';
     let accumulated = basePath;
 
-    for (let i = 0; i < parts.length; i++) {
+    for (let i = 0; i < parts.length - 1; i++) {
         accumulated += sFolderSep + parts[i];
-        html += ' / <span class="crumb" data-path="' + accumulated + '">' + parts[i] + '</span>';
+        html += sep + '<span class="crumb" data-path="' + escapeHtml(accumulated) + '">' + escapeHtml(parts[i]) + '</span>';
     }
 
-    document.getElementById('breadcrumb').innerHTML = html;
+    el.innerHTML = html;
 }
 
 function renderContent(data) {
@@ -313,6 +310,7 @@ function renderContent(data) {
     const playerControl = document.getElementById("playerControl");
     selector.length = 0;
     playerControl.style.display = "none";
+    document.body.classList.toggle('view-player', data.Subfolders.length === 0 && data.Mp3Files.length > 0);
 
     // Clean up existing DataTable if it exists
     if (typeof $ !== 'undefined' && $.fn.DataTable && $.fn.DataTable.isDataTable('#subfoldersTable')) {
@@ -321,281 +319,211 @@ function renderContent(data) {
 
     if (data.Subfolders.length > 0) {
         const isWideScreen = window.innerWidth > 1000;
+        const hasDataTables = typeof $ !== 'undefined' && $.fn.DataTable;
 
-        if (isWideScreen) {
-            // Use DataTables for wide screens
-            const tableData = [];
-            data.Subfolders.forEach(o => {
+        if (isWideScreen && hasDataTables) {
+            // Use DataTables for wide screens. Every value is escaped: titles, authors
+            // and URLs can be edited by users, and folder names can contain quotes.
+            const tableData = data.Subfolders.map(o => {
                 const f = o.Folder;
-                var name = f.split(sFolderSep).pop();
-                if (name != "images" && name != "bin" && name != "obj" && name != ".vs") {
-                    let displayName = name;
-                    let titleUrl = '';
-                    let rating = '';
-                    let rateCount = o.RateCount || '';
-                    let myRating = '';
-                    let author = '';
-                    let category = '';
-                    let pubYear = '';
+                const displayName = o.Title !== "" ? o.Title : f.split(sFolderSep).pop();
+                const url = safeUrl(o.TitleUrl);
+                const titleUrl = url
+                    ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" class="AmazonLink icon-link" aria-label="Book page" title="Book page"><svg class="icon"><use href="#i-external"/></svg></a>`
+                    : '';
+                const myRating = o.MyRating !== "" ? ratingImgHtml(o.MyRating) : '';
 
-                    if (o.Title !== "") {
-                        displayName = o.Title;
-                    }
-
-                    if (o.TitleUrl != "") {
-                        titleUrl = "<a href='" + o.TitleUrl + "' target='_blank' class='AmazonLink'>&#128279;</a>";
-                    }
-
-                    if (o.TitleRating !== "") {
-                        rating = o.TitleRating;
-                    }
-
-                    if (o.MyRating != "") {
-                        myRating = "<img class='imgRate' src='" + GetRatingImg(o.MyRating) + "'>";
-                    }
-
-                    if (o.Author !== "") {
-                        author = o.Author;
-                    }
-
-                    if (o.Category !== "") {
-                        category = o.Category;
-                    }
-
-                    if (o.PubYear !== "") {
-                        pubYear = o.PubYear;
-                    }
-
-                    // Format rate count with thousands separator while preserving numeric value
-                    let formattedRateCount = rateCount;
-                    if (rateCount && !isNaN(rateCount)) {
-                        formattedRateCount = parseInt(rateCount).toLocaleString();
-                    }
-
-                    let editBtn = `<button class="edit-folder-btn" data-path="${f}">Edit</button>`;
-
-                    tableData.push([
-                        `<span class="folder" data-path="${f}">${displayName}</span>`,
-                        rating,
-                        formattedRateCount,
-                        myRating,
-                        author,
-                        category,
-                        pubYear,
-                        editBtn,
-                        titleUrl
-                    ]);
+                let formattedRateCount = o.RateCount || '';
+                if (formattedRateCount && !isNaN(formattedRateCount)) {
+                    formattedRateCount = parseInt(formattedRateCount, 10).toLocaleString();
                 }
+
+                return [
+                    `<span class="folder" data-path="${escapeHtml(f)}">${escapeHtml(displayName)}</span>`,
+                    escapeHtml(o.TitleRating),
+                    formattedRateCount,
+                    myRating,
+                    escapeHtml(o.Author),
+                    escapeHtml(o.Category),
+                    escapeHtml(o.PubYear),
+                    `<button type="button" class="edit-folder-btn" data-path="${escapeHtml(f)}">Edit</button>`,
+                    titleUrl
+                ];
             });
 
-            html = `<table id="subfoldersTable" class="display" style="width:100%">
+            container.innerHTML = `<table id="subfoldersTable" class="display" style="width:100%">
     <thead>
         <tr>
-            <th>Folder Name</th>
+            <th>Title</th>
             <th>Rating</th>
-            <th>Rate Count</th>
-            <th>My Rating</th>
+            <th>Ratings</th>
+            <th>My rating</th>
             <th>Author</th>
             <th>Category</th>
             <th>Year</th>
-            <th>Edit</th>
+            <th></th>
             <th>Link</th>
         </tr>
     </thead>
     <tbody></tbody>
 </table>`;
 
-            container.innerHTML = html;
-
-            // Initialize DataTable when jQuery and DataTables are available
-            if (typeof $ !== 'undefined' && $.fn.DataTable) {
-                $('#subfoldersTable').DataTable({
-                    data: tableData,
-                    pageLength: 100,
-                    lengthChange: false, // Hide the "Show X entries" dropdown
-                    paging: tableData.length > 100, // Only show paging if more than 100 rows
-                    info: tableData.length > 100, // Hide the "Showing X to Y of Z entries" section
-                    order: [[0, 'asc']],
-                    columnDefs: [
-                        { orderable: false, targets: [7] }, // Disable sorting for Edit only
-                        {
-                            targets: 2, // Rate Count column (now index 2)
-                            type: 'num',
-                            render: function (data, type, row) {
-                                if (type === 'sort' || type === 'type') {
-                                    // For sorting, return the numeric value
-                                    return data ? parseInt(data.replace(/,/g, '')) || 0 : 0;
-                                }
-                                // For display, return the formatted string
-                                return data;
+            $('#subfoldersTable').DataTable({
+                data: tableData,
+                pageLength: 100,
+                lengthChange: false, // Hide the "Show X entries" dropdown
+                paging: tableData.length > 100, // Only show paging if more than 100 rows
+                info: tableData.length > 100, // Hide the "Showing X to Y of Z entries" section
+                order: [[0, 'asc']],
+                columnDefs: [
+                    { orderable: false, targets: [7] }, // Disable sorting for Edit only
+                    {
+                        targets: 2, // Rate Count column
+                        type: 'num',
+                        render: function (data, type, row) {
+                            if (type === 'sort' || type === 'type') {
+                                return data ? parseInt(String(data).replace(/[^\d]/g, ''), 10) || 0 : 0;
                             }
-                        },
-                        {
-                            targets: 3, // My Rating column (now index 3)
-                            type: 'num',
-                            render: function (data, type, row) {
-                                if (type === 'sort' || type === 'type') {
-                                    // For sorting, extract numeric value from image src
-                                    if (data && data.includes('stars-')) {
-                                        const match = data.match(/stars-(\d+)-([05])/);
-                                        if (match) {
-                                            const whole = parseInt(match[1]);
-                                            const decimal = match[2] === '5' ? 0.5 : 0;
-                                            return whole + decimal;
-                                        }
-                                    }
-                                    return 0; // No rating
-                                }
-                                // For display, return the HTML with image
-                                return data;
-                            }
-                        },
-                        {
-                            targets: 8, // Link column (now index 8)
-                            render: function (data, type, row) {
-                                if (type === 'sort' || type === 'type') {
-                                    // Extract URL from anchor tag for sorting
-                                    if (data && data.includes('href=')) {
-                                        const match = data.match(/href=['\"]([^'\"]*)['\"]/);
-                                        if (match) return match[1];
-                                    }
-                                    return '';
-                                }
-                                return data;
-                            }
-                        },
-                        { width: "20%", targets: 0 }, // Folder name column width
-                        { width: "8%", targets: 1 }, // Rating column width
-                        { width: "8%", targets: 2 }, // Rate Count column width
-                        { width: "8%", targets: 3 }, // My Rating column width
-                        { width: "20%", targets: 4 }, // Author column width
-                        { width: "15%", targets: 5 }, // Category column width
-                        { width: "7%", targets: 6 }, // Year column width
-                        { width: "5%", targets: 7 }, // Edit column width
-                        { width: "5%", targets: 8 } // Link column width
-                    ]
-                });
-
-                // Add event handler for Edit buttons
-                $('#subfoldersTable tbody').on('click', '.edit-folder-btn', function (e) {
-                    e.preventDefault();
-                    const path = this.dataset.path;
-                    if (path) {
-                        fetchFolderDataForEdit(path);
-                    }
-                });
-            } else {
-                // Fallback to regular list if DataTables is not available
-                console.warn('DataTables not available, falling back to list view');
-                html = '';
-                data.Subfolders.forEach(o => {
-                    const f = o.Folder;
-                    var name = f.split(sFolderSep).pop();
-                    if (name != "images" && name != "bin" && name != "obj" && name != ".vs") {
-                        if (o.Title !== "") name = o.Title;
-                        if (o.TitleUrl != "") name += " <a href='" + o.TitleUrl + "' target='_blank' class='AmazonLink'>&#128279;</a>";
-                        if (o.TitleRating !== "") {
-                            name += " [" + o.TitleRating;
-                            if (o.RateCount !== "") name += " - " + o.RateCount;
-                            name += "]";
+                            return data;
                         }
-                        if (o.MyRating != "") name += " <img class='imgRate' src='" + GetRatingImg(o.MyRating) + "'>";
-                        html += '<li class="folder" data-path="' + f + '">' + name + '</li>';
-                    }
-                });
-                container.innerHTML = "<ul>" + html + "</ul>";
-            }
-        } else {
-            // Use traditional list for narrow screens
-            html += '';
-            data.Subfolders.forEach(o => {
-                const f = o.Folder;
-                var name = f.split(sFolderSep).pop();
-                if (name != "images" && name != "bin" && name != "obj" && name != ".vs") {
-
-                    if (o.Title !== "") {
-                        name = o.Title;
-                    }
-
-                    if (o.TitleUrl != "") {
-                        name += " <a href='" + o.TitleUrl + "' target='_blank' class='AmazonLink'>&#128279;</a>";
-                    }
-
-                    if (o.TitleRating !== "") {
-                        name += " [" + o.TitleRating;
-
-                        if (o.RateCount !== "") {
-                            name += " - " + o.RateCount;
+                    },
+                    {
+                        targets: 3, // My Rating column
+                        type: 'num',
+                        render: function (data, type, row) {
+                            if (type === 'sort' || type === 'type') {
+                                // Extract numeric value from image src
+                                const match = data && String(data).match(/data-rating="([\d.]+)"/);
+                                if (match) return parseFloat(match[1]);
+                                return 0; // No rating
+                            }
+                            return data;
                         }
-
-                        name += "]";
-                    }
-
-                    if (o.MyRating != "") {
-                        name += " <img class='imgRate' src='" + GetRatingImg(o.MyRating) + "'>";
-                    }
-
-                    html += '<li class="folder" data-path="' + f + '">' + name + '</li>';
-                }
+                    },
+                    {
+                        targets: 8, // Link column
+                        render: function (data, type, row) {
+                            if (type === 'sort' || type === 'type') {
+                                if (data && data.includes('href=')) {
+                                    const match = data.match(/href=['"]([^'"]*)['"]/);
+                                    if (match) return match[1];
+                                }
+                                return '';
+                            }
+                            return data;
+                        }
+                    },
+                    { width: "32%", targets: 0 }, // Title
+                    { width: "7%", targets: 1 },  // Rating
+                    { width: "8%", targets: 2 },  // Number of ratings
+                    { width: "10%", targets: 3 }, // My rating
+                    { width: "17%", targets: 4 }, // Author
+                    { width: "12%", targets: 5 }, // Category
+                    { width: "6%", targets: 6 },  // Year
+                    { width: "4%", targets: 7 },  // Edit
+                    { width: "4%", targets: 8 }   // Link
+                ]
             });
 
-            container.innerHTML = "<ul>" + html + "</ul>";
+            // Edit buttons. Folder-name clicks are handled by the global click handler
+            // below; adding a second handler here used to load every folder twice.
+            $('#subfoldersTable tbody').on('click', '.edit-folder-btn', function (e) {
+                e.preventDefault();
+                e.stopPropagation();
+                const path = this.dataset.path;
+                if (path) {
+                    fetchFolderDataForEdit(path);
+                }
+            });
+        } else {
+            // Simple list for narrow screens (and as a fallback if DataTables didn't load)
+            if (isWideScreen) console.warn('DataTables not available, falling back to list view');
+            data.Subfolders.forEach(o => { html += buildFolderListItem(o); });
+            container.innerHTML = '<ul class="folder-list">' + html + "</ul>";
         }
 
     } else if (data.Mp3Files.length > 0) {
 
         playerControl.style.display = "";
-
-        html += '';
         sCurrentFolder = data.CurrentFolder;
 
+        let audioCount = 0;
         data.Mp3Files.forEach((f, index) => {
-            const name = f.split(sFolderSep).pop();
+            const name = f.split('/').pop();
             if (sCurrentFolder !== "") {
                 f = sCurrentFolder + "/" + f;
             }
+            const isAudio = f.toLowerCase().endsWith(".mp3");
+            const ch = chapterParts(name, index);
 
-            html += `<li class="file" data-path="${f}" data-index="${index}"><div class="file-inner"><span class="downloaded"></span>${name}</div></li>`;
+            html += `<li class="file${isAudio ? '' : ' is-doc'}" data-path="${escapeHtml(f)}" data-index="${index}">`
+                + `<span class="ch-num">${escapeHtml(ch.num)}</span>`
+                + `<svg class="icon ch-check" aria-hidden="true"><use href="#i-check"/></svg>`
+                + `<span class="ch-title">${escapeHtml(ch.title)}</span>`
+                + (isAudio
+                    ? `<span class="downloaded" title="Available offline"><svg class="icon icon-sm"><use href="#i-saved"/></svg></span>`
+                    : `<span class="file-kind">${escapeHtml(ch.ext.toUpperCase())}</span>`)
+                + `<span class="ch-progress" aria-hidden="true"></span>`
+                + `</li>`;
 
-            if (f.toLowerCase().endsWith(".mp3")) {
+            if (isAudio) {
+                audioCount++;
                 const option = document.createElement("option");
                 option.value = f;
-                option.textContent = name;
+                option.textContent = ch.title;
                 selector.appendChild(option);
             }
         });
 
-        loadTracks();
-
-        container.innerHTML = "<ul>" + html + "</ul>";
+        container.innerHTML = `<h3 class="list-heading">${audioCount} ${audioCount === 1 ? 'chapter' : 'chapters'}</h3>`
+            + '<ul class="chapter-list">' + html + "</ul>";
+        loadTracks(data.CurrentPath);
         checkFolderCache();
     } else {
-        container.innerHTML = '<h2>No subfolders or MP3 files found.</h2>';
+        container.innerHTML = '<p class="empty">This folder has no audiobooks or MP3 files yet.</p>';
     }
 
-    // Add event listeners for Amazon links to prevent propagation
-    document.querySelectorAll('a.AmazonLink').forEach(function (link) {
+    // Keep external-link clicks from also opening the folder
+    container.querySelectorAll('a.AmazonLink').forEach(function (link) {
         link.addEventListener('click', function (event) {
             event.stopPropagation();
         });
     });
+}
 
-    // Add event listeners for DataTable folder clicks if using DataTable
-    if (typeof $ !== 'undefined' && document.getElementById('subfoldersTable')) {
-        $('#subfoldersTable tbody').on('click', '.folder', function (e) {
-            e.preventDefault();
-            const path = this.dataset.path;
-            if (path) {
-                loadFolder(path);
-            }
-        });
+// One <li> for the narrow-screen folder list
+function buildFolderListItem(o) {
+    const f = o.Folder;
+    const title = o.Title !== "" ? o.Title : f.split(sFolderSep).pop();
+
+    const meta = [];
+    if (o.Author) meta.push('<span>' + escapeHtml(o.Author) + '</span>');
+    if (o.TitleRating !== "") {
+        let r = '<span class="book-rating"><span class="star-glyph" aria-hidden="true">★</span> ' + escapeHtml(o.TitleRating);
+        if (o.RateCount !== "") {
+            const n = parseInt(o.RateCount, 10);
+            r += ' <span class="muted">(' + escapeHtml(isNaN(n) ? o.RateCount : n.toLocaleString()) + ')</span>';
+        }
+        meta.push(r + '</span>');
     }
+    if (o.MyRating != "") meta.push('<span class="book-myrating"><span class="muted">You</span> ' + ratingImgHtml(o.MyRating) + '</span>');
+
+    const url = safeUrl(o.TitleUrl);
+    const link = url
+        ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" class="AmazonLink icon-link" aria-label="Book page" title="Book page"><svg class="icon"><use href="#i-external"/></svg></a>`
+        : '';
+
+    return '<li class="folder" data-path="' + escapeHtml(f) + '">'
+        + '<span class="folder-text"><span class="folder-title">' + escapeHtml(title) + '</span>'
+        + (meta.length ? '<span class="folder-meta">' + meta.join('') + '</span>' : '')
+        + '</span>' + link
+        + '<svg class="icon chevron" aria-hidden="true"><use href="#i-chevron"/></svg></li>';
 }
 
 function showError(msg) {
     HideSpinner();
     document.getElementById('content').innerHTML =
-        '<div style="color:red;"><strong>Error:</strong> ' + msg + '</div>';
+        '<div style="color:red;"><strong>Error:</strong> ' + escapeHtml(msg) + '</div>';
     document.getElementById('breadcrumb').innerHTML = '';
 }
 
@@ -615,18 +543,13 @@ document.addEventListener('click', function (e) {
             selector.value = path;
             if (selector.selectedIndex !== -1) {
                 const audio = document.getElementById("audioPlayer");
-                setAudioFileAndPlay(audio, selector.value)
-                window.scrollTo({ top: 0, behavior: 'smooth' });
+                pendingResumeFolder = null; // user's choice wins over a still-loading resume
+                setAudioFileAndPlay(audio, selector.value);
+                if (playingFolderPath) setServerProgress(playingFolderPath, 0, selector.value);
             }
         }
     }
 });
-
-async function fetchAuthStatus() {
-    // User is always authenticated when this JS runs
-    authState = { authenticated: true, email: '' };
-    return authState;
-}
 
 async function getServerProgress() {
     const r = await fetch('?mode=getProgress', { cache: 'no-store' });
@@ -675,81 +598,30 @@ async function resolveInitialFolder(folderParam) {
     return localStorage.getItem('lastFolderPath') || basePath;
 }
 
-function loadTracks() {
+// Listeners and timers that must exist exactly once for the page's lifetime.
+// (They used to be added on every folder visit, which stacked up duplicates:
+// several 'ended' handlers skipped tracks, several timers spammed setProgress.)
+function initPlayerOnce() {
+    if (playerInitialized) return;
+    playerInitialized = true;
+
     const audio = document.getElementById("audioPlayer");
     const selector = document.getElementById("trackSelector");
+    if (!audio || !selector) return;
 
-    // Default behavior: start with first track in the folder.
-    if (selector.length > 0) {
-        selector.selectedIndex = 0;
-        setAudioFileAndPlay(audio, selector.value);
-    }
+    initPlayerUI(audio);
 
-    // NEW: per-folder resume from UserFolder (preferred when revisiting a folder)
-    ; (async () => {
-        if (!currentData || !currentData.CurrentPath) return;
-
-        try {
-            const prog = await getServerFolderProgress(currentData.CurrentPath);
-            if (!prog || !prog.ok) return;
-
-            // Select saved file (if present in dropdown)
-            if (prog.lastFileUrl && selector.length > 0) {
-                const desired = String(prog.lastFileUrl);
-                for (let i = 0; i < selector.options.length; i++) {
-                    if (selector.options[i].value === desired) {
-                        selector.selectedIndex = i;
-                        await setAudioFile(audio, desired); // load before seeking
-                        break;
-                    }
-                }
-            }
-
-            // Seek on play
-            if (prog.lastTimeSeconds > 0) {
-                const setStartTime = () => {
-                    try { audio.currentTime = prog.lastTimeSeconds; } catch (e) { /* ignore */ }
-                    audio.removeEventListener('play', setStartTime);
-                };
-                audio.addEventListener('play', setStartTime);
-            }
-        } catch (e) {
-            // ignore
-        }
-    })();
-
+    // User picked a track from the dropdown: start it from the beginning.
     selector.addEventListener("change", () => {
+        pendingResumeFolder = null;
         setAudioFileAndPlay(audio, selector.value);
-        if (currentData && currentData.CurrentPath) {
-            setServerProgress(currentData.CurrentPath, Math.floor(audio.currentTime || 0), selector.value);
+        if (playingFolderPath) {
+            setServerProgress(playingFolderPath, 0, selector.value);
         }
     });
 
-    // Save progress every 5 seconds
-    let lastSentSeconds = -1;
-    setInterval(() => {
-        if (!audio.src || audio.paused) return;
-        if (!currentData || !currentData.CurrentPath) return;
-
-        const sCurrentTime = audio.currentTime;
-        if (sCurrentTime === undefined) return;
-        const secs = Math.floor(sCurrentTime);
-        if (secs === lastSentSeconds) return;
-        lastSentSeconds = secs;
-
-        const fileUrl = selector && selector.value ? selector.value : '';
-        setServerProgress(currentData.CurrentPath, secs, fileUrl);
-    }, 5000);
-
-    var startTime = 0;
-
     // Auto-play next track
     audio.addEventListener("ended", () => {
-
-        let endTime = performance.now();
-        if (startTime > 0 && endTime - startTime < 1000) return;
-        startTime = endTime;
-
         const currentIndex = selector.selectedIndex;
         if (currentIndex >= 0 && currentIndex < selector.options.length - 1) {
             const nextOption = selector.options[currentIndex + 1];
@@ -758,8 +630,79 @@ function loadTracks() {
         }
     });
 
+    // Save progress every 5 seconds while playing, and right away on pause.
+    setInterval(() => saveCurrentProgress(false), 5000);
+    audio.addEventListener('pause', () => saveCurrentProgress(true));
+
     // Update highlights/progress bar every 500ms
     setInterval(updateHighlights, 500);
+}
+
+function saveCurrentProgress(evenIfPaused) {
+    const audio = document.getElementById("audioPlayer");
+    const selector = document.getElementById("trackSelector");
+    if (!audio || !audio.src || !playingFolderPath) return;
+    if (audio.readyState < 1) return; // a new track is still loading; position isn't meaningful yet
+    if (audio.paused && !evenIfPaused) return;
+    // Don't save while a resume is still loading, or we'd overwrite the saved spot with 0.
+    if (pendingResumeFolder === playingFolderPath) return;
+
+    const secs = Math.floor(audio.currentTime || 0);
+    const fileUrl = selector && selector.value ? selector.value : '';
+    const key = playingFolderPath + '|' + fileUrl + '|' + secs;
+    if (key === lastSavedProgressKey) return;
+    lastSavedProgressKey = key;
+
+    setServerProgress(playingFolderPath, secs, fileUrl);
+}
+
+// Called for each folder that contains MP3s, after the selector has been filled.
+// Resumes the saved track/position for this folder, otherwise starts at track 1.
+async function loadTracks(folderPath) {
+    initPlayerOnce();
+
+    const audio = document.getElementById("audioPlayer");
+    const selector = document.getElementById("trackSelector");
+    const myLoad = ++trackLoadSeq;
+
+    playingFolderPath = folderPath || '';
+    lastSavedProgressKey = '';
+    playingBook = {
+        title: (currentData && (currentData.Title || folderDisplayName(currentData.CurrentPath))) || '',
+        author: (currentData && currentData.Author) || ''
+    };
+    if (selector.length === 0) return;
+
+    let startFile = selector.options[0].value;
+    let startTime = 0;
+
+    pendingResumeFolder = playingFolderPath;
+    try {
+        const prog = await getServerFolderProgress(playingFolderPath);
+        if (myLoad !== trackLoadSeq) return; // user already moved on
+
+        if (prog && prog.ok && prog.lastFileUrl) {
+            const desired = String(prog.lastFileUrl);
+            const exists = Array.from(selector.options).some(o => o.value === desired);
+            if (exists) {
+                startFile = desired;
+                startTime = Math.max(0, Number(prog.lastTimeSeconds) || 0);
+            }
+        }
+    } catch (e) {
+        // no saved progress; start at the beginning
+    }
+    if (myLoad !== trackLoadSeq) return;
+
+    // If the user picked a track while progress was loading, respect that choice.
+    if (pendingResumeFolder !== playingFolderPath) return;
+
+    selector.value = startFile;
+    await setAudioFile(audio, startFile, startTime);
+    pendingResumeFolder = null;
+    if (myLoad !== trackLoadSeq) return;
+
+    playAudio(audio);
 }
 
 function updateHighlights() {
@@ -770,32 +713,24 @@ function updateHighlights() {
 
     let currentIndex = -1;
     fileElements.forEach((el, i) => {
-        const filePath = el.dataset.path;
-        if (filePath === currentPath) {
-            currentIndex = i;
-        }
-
-        el.classList.remove("highlighted", "current");
-        const inner = el.querySelector('.file-inner');
-        if (inner) inner.style.background = '';
+        if (el.dataset.path === currentPath) currentIndex = i;
     });
 
     fileElements.forEach((el, i) => {
-        if (i < currentIndex) {
-            el.classList.add("highlighted");
-        } else if (i === currentIndex) {
-            el.classList.add("current");
+        const isCurrent = i === currentIndex;
+        el.classList.toggle("is-done", i < currentIndex && !el.classList.contains('is-doc'));
+        el.classList.toggle("is-current", isCurrent);
+        if (isCurrent) {
+            el.setAttribute('aria-current', 'true');
+            const pct = audio.duration > 0 ? (audio.currentTime / audio.duration) * 100 : 0;
+            el.style.setProperty('--p', pct.toFixed(2) + '%');
+        } else {
+            el.removeAttribute('aria-current');
+            el.style.removeProperty('--p');
         }
     });
 
-    if (currentIndex !== -1) {
-        const currentEl = fileElements[currentIndex];
-        const inner = currentEl.querySelector('.file-inner');
-        if (inner && audio.duration > 0) {
-            const percent = (audio.currentTime / audio.duration) * 100;
-            inner.style.background = `linear-gradient(to right, #add8e6 ${percent}%, transparent ${percent}%)`;
-        }
-    }
+    updateNowPlaying();
 }
 
 function goForwardSec(sec) {
@@ -805,7 +740,7 @@ function goForwardSec(sec) {
     const forward = Math.abs(Number(sec) || 0);
     if (forward <= 0) return;
 
-    // If metadata not loaded yet, fallback to simple add and clamp later.
+    // If metadata not loaded yet, fall back to a simple add.
     const canUseDuration = Number.isFinite(audio.duration) && audio.duration > 0;
 
     if (!canUseDuration) {
@@ -821,9 +756,9 @@ function goForwardSec(sec) {
         return;
     }
 
-    // Spill into next track(s)
-    let remaining = targetTime - audio.duration;
-    let currentIndex = selector.selectedIndex;
+    // Spill into next track
+    const remaining = targetTime - audio.duration;
+    const currentIndex = selector.selectedIndex;
 
     // No next track: clamp to end
     if (currentIndex < 0 || currentIndex >= selector.options.length - 1) {
@@ -831,18 +766,9 @@ function goForwardSec(sec) {
         return;
     }
 
-    // Move to next track
     const nextOption = selector.options[currentIndex + 1];
     selector.value = nextOption.value;
-    setAudioFile(audio, nextOption.value);
-
-    audio.addEventListener('loadedmetadata', function handler() {
-        // If remaining exceeds next duration, you could iterate; keep minimal and clamp within next track.
-        const dur = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0;
-        audio.currentTime = dur > 0 ? Math.min(remaining, dur) : 0;
-        audio.play();
-        audio.removeEventListener('loadedmetadata', handler);
-    });
+    setAudioFileAndPlay(audio, nextOption.value, dur => Math.min(remaining, dur));
 }
 
 function goBackSec(sec) {
@@ -851,30 +777,24 @@ function goBackSec(sec) {
 
     if (audio.currentTime > sec) {
         audio.currentTime -= sec;
-    } else {
-        const currentIndex = selector.selectedIndex;
-        if (currentIndex > 1) {
-            const prevOption = selector.options[currentIndex - 1];
-            const offset = sec - audio.currentTime;
-            selector.value = prevOption.value;
-            setAudioFile(audio, prevOption.value)
+        return;
+    }
 
-            audio.addEventListener('loadedmetadata', function handler() {
-                const seekTime = Math.max(0, audio.duration - offset);
-                audio.currentTime = seekTime;
-                audio.play();
-                audio.removeEventListener('loadedmetadata', handler);
-            });
-        } else {
-            audio.currentTime = 0;
-        }
+    const currentIndex = selector.selectedIndex;
+    if (currentIndex > 0) { // was "> 1", which blocked going back from track 2 to track 1
+        const prevOption = selector.options[currentIndex - 1];
+        const offset = sec - audio.currentTime;
+        selector.value = prevOption.value;
+        setAudioFileAndPlay(audio, prevOption.value, dur => Math.max(0, dur - offset));
+    } else {
+        audio.currentTime = 0;
     }
 }
 
 function ShowSpinner() {
     document.getElementById('spinnerContainer').style.display = "";
     const audio = document.getElementById("audioPlayer");
-    audio.pause()
+    if (audio) audio.pause();
 }
 
 function HideSpinner() {
@@ -885,6 +805,18 @@ function OpenFolderDialog(bTable, data) {
     editDialogOpenedFromTable = bTable;
     const folderData = data || currentData;
     if (folderData) SetModal(folderData);
+
+    // Only the user's own rating is editable when shared metadata is admin-only.
+    const canEditShared = window.CAN_EDIT_SHARED !== false;
+    ['editTitle', 'editTitleUrl', 'editRate', 'editRateCount', 'editAuthor', 'editCategory', 'editPublicationDate']
+        .forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.disabled = !canEditShared;
+        });
+
+    const msg = document.getElementById('editFolderMsg');
+    if (msg) msg.textContent = '';
+
     document.getElementById("editFolderModal").showModal();
 }
 
@@ -914,7 +846,8 @@ function CloseFolderDialog() {
 
 function SaveFolderDialog() {
     const data = new URLSearchParams();
-    data.append('folderPath', document.getElementById('editFolderPath').value);
+    const savedPath = document.getElementById('editFolderPath').value;
+    data.append('folderPath', savedPath);
     data.append('title', document.getElementById('editTitle').value);
     data.append('titleUrl', document.getElementById('editTitleUrl').value);
     data.append('myRating', document.getElementById('editMyRating').value);
@@ -924,34 +857,68 @@ function SaveFolderDialog() {
     data.append('category', document.getElementById('editCategory').value);
     data.append('publicationDate', document.getElementById('editPublicationDate').value);
 
-    ShowSpinner();
+    const msg = document.getElementById('editFolderMsg');
+    if (msg) msg.textContent = '';
+
+    // Don't use ShowSpinner() here: it pauses playback, and saving a rating
+    // shouldn't stop the book you're listening to.
+    document.getElementById('spinnerContainer').style.display = "";
 
     fetch('?mode=updateFolder', {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: data.toString()
     })
-        .then(r => { HideSpinner(); return r.json(); })
+        .then(r => r.json())
         .then(resp => {
-            if (resp.success) {
-                CloseFolderDialog();
-                const currentPath = currentData ? currentData.CurrentPath : basePath;
-                // Always refresh folder list after edit
-                loadFolder(currentPath);
+            HideSpinner();
+            if (!resp.success) {
+                if (msg) msg.textContent = resp.error || 'Update failed.';
+                else alert(resp.error || 'Update failed.');
+                return;
+            }
+            CloseFolderDialog();
+
+            const isPlayerView = currentData && currentData.Mp3Files && currentData.Mp3Files.length > 0;
+            if (isPlayerView && !editDialogOpenedFromTable) {
+                // Edited the book that's open in the player: refresh only the header,
+                // so playback isn't restarted.
+                refreshCurrentFolderInfo();
             } else {
-                alert(resp.error || 'Update failed.');
+                // Edited a row in the folder listing: reload the listing.
+                loadFolder(currentData ? currentData.CurrentPath : basePath);
             }
         })
         .catch(err => {
             HideSpinner();
-            alert(err.message);
+            if (msg) msg.textContent = err.message;
+            else alert(err.message);
         });
+}
+
+// Re-read the current folder's metadata and update the header without re-rendering the player.
+function refreshCurrentFolderInfo() {
+    if (!currentData) return;
+    const path = currentData.CurrentPath;
+    fetch('?mode=json', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'folderPath=' + encodeURIComponent(path)
+    })
+        .then(r => r.json())
+        .then(data => {
+            if (data.error || !currentData || currentData.CurrentPath !== path) return;
+            ['Title', 'TitleUrl', 'TitleRating', 'MyRating', 'RateCount', 'Author', 'Category', 'PubYear', 'PubDate']
+                .forEach(k => { currentData[k] = data[k]; });
+            renderRatings(currentData);
+            SetModal(currentData);
+        })
+        .catch(() => { /* header just stays as it was */ });
 }
 
 // Fetch folder data for editing (does not re-render the view)
 function fetchFolderDataForEdit(path) {
-    editDialogOpenedFromTable = true;
-    ShowSpinner();
+    document.getElementById('spinnerContainer').style.display = "";
     fetch('?mode=json', {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -969,97 +936,163 @@ function fetchFolderDataForEdit(path) {
         });
 }
 
-function setAudioFileAndPlay(audio, sFile) {
-    setAudioFile(audio, sFile).then(() => {
-        try {
-            audio.play();
-        } catch (ex) {
-            console.error('Error playing audio file:', err);
-        }
-    }).catch(err => {
-        console.error('Error setting audio file:', err);
-    })
+function playAudio(audio) {
+    initializeAudioGain();
+    const p = audio.play();
+    if (p && typeof p.catch === 'function') {
+        // Autoplay can be blocked until the user interacts with the page; that's fine,
+        // the Play button still works.
+        p.catch(err => console.warn('Playback did not start:', err && err.message));
+    }
 }
 
-async function setAudioFile(audio, sFile) {
-    // When switching tracks, force UI to "Play" until we actually start playing.
-    // (Prevents stale "Pause" icon from previous track.)
-    const playPauseButton = document.getElementById('playPauseButton');
-    if (playPauseButton) {
-        playPauseButton.textContent = '▶︎';
-        playPauseButton.title = 'Play';
+// startTime: seconds, or a function (duration) => seconds for seeks that depend
+// on the new track's length (used by +30 / -30 across track boundaries).
+function setAudioFileAndPlay(audio, sFile, startTime = 0) {
+    setAudioFile(audio, sFile, startTime)
+        .then(() => playAudio(audio))
+        .catch(err => console.error('Error setting audio file:', err));
+}
+
+async function setAudioFile(audio, sFile, startTime = 0) {
+    const myToken = ++audioLoadToken;
+
+    // When switching tracks, show "Play" until playback actually starts.
+    setPlayButtonsState(false);
+
+    let src = sFile;
+    let objectUrl = null;
+    try {
+        if ('caches' in window) {
+            const cache = await caches.open('mp3-cache');
+            const response = await cache.match(sFile);
+            if (response) {
+                objectUrl = URL.createObjectURL(await response.blob());
+                src = objectUrl;
+            }
+        }
+    } catch (e) {
+        // Cache unavailable (e.g. plain http): stream from the server instead.
     }
 
-    const cache = await caches.open('mp3-cache');
-    const response = await cache.match(sFile);
-    if (!response) {
-        audio.src = sFile;
+    // A newer track was requested while we were reading the cache.
+    if (myToken !== audioLoadToken) {
+        if (objectUrl) URL.revokeObjectURL(objectUrl);
         return;
     }
 
-    const blob = await response.blob();
-    const url = URL.createObjectURL(blob);
-    audio.src = url;
-    audio.onended = () => URL.revokeObjectURL(url);
+    // Free the previous cached track's memory before switching.
+    if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
+    currentObjectUrl = objectUrl;
+
+    const needsSeek = typeof startTime === 'function' || startTime > 0;
+    const metadataReady = needsSeek
+        ? new Promise(resolve => {
+            audio.addEventListener('loadedmetadata', function onMeta() {
+                audio.removeEventListener('loadedmetadata', onMeta);
+                if (myToken === audioLoadToken) {
+                    const dur = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0;
+                    let t = typeof startTime === 'function' ? startTime(dur) : startTime;
+                    if (dur > 0) t = Math.min(t, Math.max(0, dur - 1));
+                    try { audio.currentTime = Math.max(0, t || 0); } catch (e) { /* ignore */ }
+                }
+                resolve();
+            });
+        })
+        : null;
+
+    audio.src = src;
+
+    // Wait for the seek so playback starts at the right spot, not at 0:00 then jumps.
+    if (metadataReady) {
+        await Promise.race([metadataReady, new Promise(r => setTimeout(r, 15000))]);
+    }
 }
 
 async function cacheFolder() {
-    var btnCacheFolder = document.getElementById("btnCacheFolder");
-    var sOldVal = btnCacheFolder.innerHTML;
-    btnCacheFolder.value = "Caching..."
-
-    const selector = document.getElementById("trackSelector");
-    for (var i = 0; i < selector.options.length; i++) {
-        var sFile = selector.options[i].value;
-        await downloadAndCache(sFile, i);
+    const btn = document.getElementById("btnCacheFolder");
+    if (!('caches' in window)) {
+        alert('Offline downloads need the site to be opened over HTTPS.');
+        return;
     }
+    const selector = document.getElementById("trackSelector");
+    const total = selector.options.length;
+    btn.disabled = true;
 
-    btnCacheFolder.innerHTML = sOldVal;
+    try {
+        for (let i = 0; i < total; i++) {
+            setCacheButton('busy', `${i + 1} of ${total}`);
+            try {
+                await downloadAndCache(selector.options[i].value, i);
+            } catch (e) {
+                console.error('Caching failed for', selector.options[i].value, e);
+                setCacheIcon(i, false);
+            }
+        }
+    } finally {
+        btn.disabled = false;
+        await checkFolderCache();
+    }
+}
+
+// state: 'idle' | 'busy' | 'done'
+function setCacheButton(state, text) {
+    const btn = document.getElementById("btnCacheFolder");
+    if (!btn) return;
+    btn.classList.toggle('is-on', state === 'done');
+    btn.classList.toggle('is-busy', state === 'busy');
+    const label = btn.querySelector('.act-label');
+    if (label) label.textContent = text || (state === 'done' ? 'Offline' : 'Download');
+    btn.title = state === 'done' ? 'All chapters are saved for offline listening' : 'Save all chapters for offline listening';
 }
 
 async function downloadAndCache(sFile, i) {
     const cache = await caches.open('mp3-cache');
     const match = await cache.match(sFile);
     if (match) {
-        setCacheIcon(i, true)
+        setCacheIcon(i, true);
         return;
     }
 
     const response = await fetch(sFile);
 
     if (!response.ok) {
-        setCacheIcon(i, false)
+        setCacheIcon(i, false);
         return;
     }
 
-    await cache.put(sFile, response.clone());
-    setCacheIcon(i, true)
+    await cache.put(sFile, response);
+    setCacheIcon(i, true);
 }
 
-
 async function checkFolderCache() {
+    if (!('caches' in window)) return;
     const selector = document.getElementById("trackSelector");
-    for (var i = 0; i < selector.options.length; i++) {
-        var sFile = selector.options[i].value;
-        await checkCache(sFile, i);
+    const total = selector.options.length;
+    let cached = 0;
+    for (let i = 0; i < total; i++) {
+        try {
+            if (await checkCache(selector.options[i].value, i)) cached++;
+        } catch (e) {
+            // ignore
+        }
     }
+    const btn = document.getElementById("btnCacheFolder");
+    if (btn && !btn.disabled) setCacheButton(total > 0 && cached === total ? 'done' : 'idle');
 }
 
 async function checkCache(sFile, i) {
     const cache = await caches.open('mp3-cache');
     const match = await cache.match(sFile);
     setCacheIcon(i, !!match);
+    return !!match;
 }
 
 function setCacheIcon(i, match) {
-    const span = document.querySelector(`li.file[data-index="${i}"] span.downloaded`);
-    if (match) {
-        span.innerHTML = "&#x2611; "; //Check Mark &#x1F5F8;
-    } else {
-        span.innerHTML = "&#x25CB; "; //White Circle
-    }
+    // The user may have navigated to another folder while this was running.
+    const li = document.querySelector(`li.file[data-index="${i}"]`);
+    if (li) li.classList.toggle('is-cached', !!match);
 }
-
 
 function initializeAudioGain() {
     if (bAudioGaininitialized) return;
@@ -1091,8 +1124,11 @@ function applyVolumeStep() {
 
     const volumeButton = document.getElementById('volumeButton');
     if (volumeButton) {
-        volumeButton.textContent = step.icon;
-        volumeButton.title = step.label;
+        volumeButton.dataset.level = String(volumeStepIndex);
+        volumeButton.classList.toggle('is-on', volumeStepIndex > 0);
+        volumeButton.title = 'Volume boost: ' + step.label;
+        const label = volumeButton.querySelector('.act-label');
+        if (label) label.textContent = step.label;
     }
 }
 
@@ -1131,7 +1167,7 @@ async function openUserListDialog(opts) {
         const data = await r.json();
 
         if (!data.ok) {
-            content.innerHTML = '<p style="color:red;">Error: ' + (data.error || 'Failed to load') + '</p>';
+            content.innerHTML = '<p style="color:red;">Error: ' + escapeHtml(data.error || 'Failed to load') + '</p>';
             return;
         }
 
@@ -1160,14 +1196,15 @@ async function openUserListDialog(opts) {
             const tableData = items.map(b => {
                 const ratingDisplay = b.rate !== null ? b.rate.toFixed(1) : '';
                 const rateCountDisplay = b.rateCount !== null ? ' (' + b.rateCount.toLocaleString() + ')' : '';
-                const myRatingHtml = b.myRating !== null ? '<img class="imgRate" src="' + GetRatingImg(b.myRating) + '">' : '';
-                const urlHtml = b.url ? '<a href="' + b.url + '" target="_blank" title="Open external link">&#128279;</a>' : '';
+                const myRatingHtml = b.myRating !== null ? ratingImgHtml(b.myRating) : '';
+                const url = safeUrl(b.url);
+                const urlHtml = url ? '<a href="' + escapeHtml(url) + '" target="_blank" rel="noopener noreferrer" title="Open external link">&#128279;</a>' : '';
 
                 return [
                     '<a href="#" class="bookmark-link" data-path="' + escapeHtml(b.folderPath) + '">' + escapeHtml(b.bookName) + '</a>',
                     escapeHtml(b.author || ''),
                     escapeHtml(b.parentName || ''),
-                    { display: ratingDisplay + rateCountDisplay, sort: b.rate !== null ? b.rate : 0 },
+                    { display: escapeHtml(ratingDisplay + rateCountDisplay), sort: b.rate !== null ? b.rate : 0 },
                     { display: myRatingHtml, sort: b.myRating !== null ? b.myRating : 0 },
                     urlHtml
                 ];
@@ -1223,10 +1260,11 @@ async function openUserListDialog(opts) {
         items.forEach(b => {
             const ratingDisplay = b.rate !== null ? b.rate.toFixed(1) : '';
             const rateCountDisplay = b.rateCount !== null ? ' (' + b.rateCount.toLocaleString() + ')' : '';
-            const myRatingHtml = b.myRating !== null ? '<img class="imgRate" src="' + GetRatingImg(b.myRating) + '">' : '';
+            const myRatingHtml = b.myRating !== null ? ratingImgHtml(b.myRating) : '';
             const author = b.author ? escapeHtml(b.author) : '';
             const parent = b.parentName ? escapeHtml(b.parentName) : '';
-            const urlHtml = b.url ? '<a class="AmazonLink" href="' + escapeHtml(b.url) + '" target="_blank" title="Open external link">&#128279;</a>' : '';
+            const url = safeUrl(b.url);
+            const urlHtml = url ? '<a class="AmazonLink" href="' + escapeHtml(url) + '" target="_blank" rel="noopener noreferrer" title="Open external link">&#128279;</a>' : '';
 
             listHtml += `
 <li class="userlist-item">
@@ -1264,7 +1302,7 @@ async function openUserListDialog(opts) {
             });
         });
     } catch (e) {
-        content.innerHTML = '<p style="color:red;">Error loading: ' + e.message + '</p>';
+        content.innerHTML = '<p style="color:red;">Error loading: ' + escapeHtml(e.message) + '</p>';
     }
 }
 
@@ -1276,9 +1314,300 @@ function closeBookmarksDialog() {
     document.getElementById('bookmarksModal').close();
 }
 
+// Escapes all five HTML-significant characters, so the result is safe both as
+// element text and inside quoted attributes. (The old textContent/innerHTML trick
+// did not escape quotes.)
 function escapeHtml(text) {
-    if (!text) return '';
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
+    if (text === null || text === undefined) return '';
+    return String(text).replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+}
+
+// Only allow http(s) links; blocks javascript: and data: URLs stored in the database.
+function safeUrl(u) {
+    if (!u) return '';
+    try {
+        const x = new URL(String(u), window.location.href);
+        return (x.protocol === 'http:' || x.protocol === 'https:') ? x.href : '';
+    } catch (e) {
+        return '';
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Player UI: play/pause buttons, seek bar, chapter title, speed, mini player,
+// and lock-screen / headphone controls (Media Session).
+// ---------------------------------------------------------------------------
+
+const SPEEDS = [1, 1.25, 1.5, 1.75, 2, 0.75];
+let speedIndex = 0;
+let isSeeking = false;
+let transportInView = true;
+let playingBook = { title: '', author: '' };
+let lastMediaKey = '';
+
+function initPlayerUI(audio) {
+    // Play / pause (main + mini)
+    ['playPauseButton', 'miniPlayButton'].forEach(id => {
+        const b = document.getElementById(id);
+        if (b) b.addEventListener('click', togglePlay);
+    });
+    ['play', 'pause', 'ended', 'loadedmetadata', 'canplay'].forEach(ev =>
+        audio.addEventListener(ev, syncPlayPauseUI));
+
+    // Previous / next chapter
+    const prev = document.getElementById('prevTrackButton');
+    const next = document.getElementById('nextTrackButton');
+    if (prev) prev.addEventListener('click', () => previousChapter());
+    if (next) next.addEventListener('click', () => goToTrack(1));
+
+    // Seek bar: preview while dragging, seek on release
+    const seekBar = document.getElementById('seekBar');
+    if (seekBar) {
+        seekBar.addEventListener('input', () => {
+            isSeeking = true;
+            const dur = audioDuration(audio);
+            const t = dur * (seekBar.value / 1000);
+            seekBar.style.setProperty('--pct', (seekBar.value / 10) + '%');
+            setText('timeElapsed', formatTime(t));
+            setText('timeRemaining', dur ? '-' + formatTime(dur - t) : '');
+        });
+        seekBar.addEventListener('change', () => {
+            const dur = audioDuration(audio);
+            if (dur) audio.currentTime = dur * (seekBar.value / 1000);
+            isSeeking = false;
+            updateTimes();
+        });
+    }
+    ['timeupdate', 'loadedmetadata', 'durationchange', 'emptied', 'seeked'].forEach(ev =>
+        audio.addEventListener(ev, updateTimes));
+
+    // Playback speed (remembered on this device)
+    try {
+        const saved = parseFloat(localStorage.getItem('playbackSpeed'));
+        const idx = SPEEDS.indexOf(saved);
+        if (idx >= 0) speedIndex = idx;
+    } catch (e) { /* ignore */ }
+    const speedButton = document.getElementById('speedButton');
+    if (speedButton) {
+        speedButton.addEventListener('click', () => {
+            speedIndex = (speedIndex + 1) % SPEEDS.length;
+            try { localStorage.setItem('playbackSpeed', String(SPEEDS[speedIndex])); } catch (e) { /* ignore */ }
+            applySpeed();
+        });
+    }
+    audio.addEventListener('loadedmetadata', applySpeed);
+    applySpeed();
+
+    // Mini player: appears when the main controls scroll out of view
+    const transport = document.querySelector('#playerControl .transport');
+    if (transport && 'IntersectionObserver' in window) {
+        new IntersectionObserver(entries => {
+            transportInView = entries[entries.length - 1].isIntersecting;
+            updateMiniVisibility();
+        }).observe(transport);
+    }
+    const miniInfo = document.getElementById('miniInfo');
+    if (miniInfo) {
+        miniInfo.addEventListener('click', () => {
+            const player = document.getElementById('playerControl');
+            if (player) player.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        });
+    }
+
+    initMediaSession(audio);
+    syncPlayPauseUI();
+    updateTimes();
+}
+
+function togglePlay() {
+    const audio = document.getElementById('audioPlayer');
+    if (!audio || !audio.src) return;
+    if (audio.paused || audio.ended) {
+        playAudio(audio);
+    } else {
+        audio.pause();
+    }
+    syncPlayPauseUI();
+}
+
+function syncPlayPauseUI() {
+    const audio = document.getElementById('audioPlayer');
+    const isPlaying = !!audio && audio.readyState >= 1 && !audio.paused && !audio.ended;
+    setPlayButtonsState(isPlaying);
+}
+
+function setPlayButtonsState(isPlaying) {
+    ['playPauseButton', 'miniPlayButton'].forEach(id => {
+        const b = document.getElementById(id);
+        if (!b) return;
+        const label = isPlaying ? 'Pause' : 'Play';
+        b.dataset.state = isPlaying ? 'playing' : 'paused';
+        b.setAttribute('aria-label', label);
+        b.title = label;
+    });
+    if ('mediaSession' in navigator) {
+        try { navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused'; } catch (e) { /* ignore */ }
+    }
+}
+
+// Previous: restart the chapter if we're more than 5 s in, otherwise go back one.
+function previousChapter() {
+    const audio = document.getElementById('audioPlayer');
+    if (audio && audio.currentTime > 5) {
+        audio.currentTime = 0;
+        return;
+    }
+    goToTrack(-1);
+}
+
+function goToTrack(delta) {
+    const audio = document.getElementById('audioPlayer');
+    const selector = document.getElementById('trackSelector');
+    const i = selector.selectedIndex + delta;
+    if (i < 0 || i >= selector.options.length) return;
+    selector.selectedIndex = i;
+    pendingResumeFolder = null;
+    setAudioFileAndPlay(audio, selector.value);
+    if (playingFolderPath) setServerProgress(playingFolderPath, 0, selector.value);
+}
+
+function audioDuration(audio) {
+    return audio && Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0;
+}
+
+function updateTimes() {
+    const audio = document.getElementById('audioPlayer');
+    if (!audio) return;
+    const dur = audioDuration(audio);
+    const cur = audio.currentTime || 0;
+    const pct = dur ? Math.min(100, (cur / dur) * 100) : 0;
+
+    const seekBar = document.getElementById('seekBar');
+    if (seekBar && !isSeeking) {
+        seekBar.value = String(Math.round(pct * 10));
+        seekBar.style.setProperty('--pct', pct + '%');
+        seekBar.disabled = !dur;
+        setText('timeElapsed', formatTime(cur));
+        setText('timeRemaining', dur ? '-' + formatTime(dur - cur) : '');
+    }
+
+    const mini = document.getElementById('miniProgress');
+    if (mini) mini.style.width = pct + '%';
+
+    if (dur && 'mediaSession' in navigator && navigator.mediaSession.setPositionState) {
+        try {
+            navigator.mediaSession.setPositionState({
+                duration: dur,
+                playbackRate: audio.playbackRate || 1,
+                position: Math.min(cur, dur)
+            });
+        } catch (e) { /* ignore */ }
+    }
+}
+
+function updateNowPlaying() {
+    const selector = document.getElementById('trackSelector');
+    if (!selector) return;
+    const idx = selector.selectedIndex;
+    const total = selector.options.length;
+    const title = idx >= 0 ? selector.options[idx].textContent : '';
+
+    setText('npIndex', total ? `Chapter ${idx + 1} of ${total}` : '');
+    setText('npTitle', title);
+    setText('miniTitle', title);
+    setText('miniSub', playingBook.title);
+
+    const prev = document.getElementById('prevTrackButton');
+    const next = document.getElementById('nextTrackButton');
+    if (prev) prev.disabled = idx < 0;
+    if (next) next.disabled = idx < 0 || idx >= total - 1;
+
+    updateMiniVisibility();
+    updateMediaMetadata(title);
+}
+
+function updateMiniVisibility() {
+    const mini = document.getElementById('miniPlayer');
+    const player = document.getElementById('playerControl');
+    const audio = document.getElementById('audioPlayer');
+    if (!mini || !player || !audio) return;
+    const onPlayerView = player.style.display !== 'none' && !!audio.getAttribute('src');
+    const show = onPlayerView && !transportInView;
+    if (mini.hidden === show) mini.hidden = !show;
+    document.body.classList.toggle('has-mini', show);
+}
+
+function applySpeed() {
+    const audio = document.getElementById('audioPlayer');
+    const rate = SPEEDS[speedIndex] || 1;
+    if (audio) {
+        audio.defaultPlaybackRate = rate;
+        audio.playbackRate = rate;
+    }
+    const b = document.getElementById('speedButton');
+    if (b) {
+        const v = b.querySelector('.speed-value');
+        if (v) v.textContent = String(rate) + '×';
+        b.classList.toggle('is-on', rate !== 1);
+        b.title = 'Playback speed: ' + rate + '×';
+    }
+}
+
+// Lock screen, headphones, car controls
+function initMediaSession(audio) {
+    if (!('mediaSession' in navigator)) return;
+    const handlers = {
+        play: () => playAudio(audio),
+        pause: () => audio.pause(),
+        seekbackward: d => goBackSec((d && d.seekOffset) || 30),
+        seekforward: d => goForwardSec((d && d.seekOffset) || 30),
+        previoustrack: () => previousChapter(),
+        nexttrack: () => goToTrack(1),
+        seekto: d => { if (d && typeof d.seekTime === 'number') audio.currentTime = d.seekTime; }
+    };
+    Object.keys(handlers).forEach(action => {
+        try { navigator.mediaSession.setActionHandler(action, handlers[action]); } catch (e) { /* unsupported action */ }
+    });
+}
+
+function updateMediaMetadata(chapterTitle) {
+    if (!('mediaSession' in navigator) || typeof MediaMetadata === 'undefined') return;
+    const key = chapterTitle + '|' + playingBook.title;
+    if (!chapterTitle || key === lastMediaKey) return;
+    lastMediaKey = key;
+    try {
+        navigator.mediaSession.metadata = new MediaMetadata({
+            title: chapterTitle,
+            artist: playingBook.author,
+            album: playingBook.title,
+            artwork: [{ src: 'images/icon192.png', sizes: '192x192', type: 'image/png' }]
+        });
+    } catch (e) { /* ignore */ }
+}
+
+// "03. The Debate Over Evolution.mp3" -> { num: "03", title: "The Debate Over Evolution", ext: "mp3" }
+function chapterParts(fileName, index) {
+    const name = String(fileName).split('/').pop();
+    const extMatch = name.match(/\.([a-z0-9]{2,4})$/i);
+    const ext = extMatch ? extMatch[1] : '';
+    const base = extMatch ? name.slice(0, -extMatch[0].length) : name;
+    const m = base.match(/^(\d{1,4})\s*[.)_-]?\s+(.+)$/) || base.match(/^(\d{1,4})[._-](.+)$/);
+    if (m) return { num: m[1].padStart(2, '0'), title: m[2].trim(), ext: ext };
+    return { num: String(index + 1).padStart(2, '0'), title: base, ext: ext };
+}
+
+function formatTime(sec) {
+    sec = Math.max(0, Math.floor(sec || 0));
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = String(sec % 60).padStart(2, '0');
+    return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${s}` : `${m}:${s}`;
+}
+
+function setText(id, text) {
+    const el = document.getElementById(id);
+    if (el && el.textContent !== text) el.textContent = text;
 }
