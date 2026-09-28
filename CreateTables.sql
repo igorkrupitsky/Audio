@@ -14,8 +14,10 @@ CREATE TABLE `Folder` (
 	`FolderExists` BIT(1) NULL DEFAULT NULL,
 	`UrlUpdated` DATETIME NULL DEFAULT NULL,
 	`FolderUpdated` DATETIME NULL DEFAULT NULL,
-	PRIMARY KEY (`FolderId`) USING BTREE
-) 
+	PRIMARY KEY (`FolderId`) USING BTREE,
+	KEY `IX_Folder_FolderPath` (`FolderPath`(191)),
+	KEY `IX_Folder_FolderName` (`FolderName`(191))
+);
 
 CREATE TABLE `AppUser` (
   `UserId` INT(10) UNSIGNED ZEROFILL NOT NULL AUTO_INCREMENT,
@@ -24,8 +26,9 @@ CREATE TABLE `AppUser` (
   `LastLoginDate` DATETIME NULL DEFAULT NULL,
   `LastFolderId` INT(10) UNSIGNED,
   `LastTimeSeconds` INT(10) UNSIGNED,
-  `LastFileUrl` VARCHAR(300) NULL DEFAULT NULL,
-  PRIMARY KEY (`UserId`) USING BTREE
+  `LastFileUrl` VARCHAR(2000) NULL DEFAULT NULL,
+  PRIMARY KEY (`UserId`) USING BTREE,
+  UNIQUE KEY `UX_AppUser_Email` (`Email`)
 );
 
 CREATE TABLE `UserLogin` (
@@ -41,17 +44,15 @@ CREATE TABLE `UserLogin` (
 CREATE TABLE `UserFolder` (
 	`UserId` INT(10) UNSIGNED ZEROFILL NOT NULL,
 	`FolderId` INT(10) UNSIGNED ZEROFILL NOT NULL,	
-	`Rating` DOUBLE NOT NULL,
+	`Rating` DOUBLE NULL DEFAULT NULL,
 	`IsFave` BIT(1) NOT NULL DEFAULT b'0',
 	`LastTimeSeconds` INT(10) UNSIGNED NULL DEFAULT NULL,
-	`LastFileUrl` VARCHAR(300) NULL DEFAULT NULL,
-	`DateRated` DATETIME NOT NULL,		
+	`LastFileUrl` VARCHAR(2000) NULL DEFAULT NULL,
+	`DateRated` DATETIME NULL DEFAULT NULL,
 	PRIMARY KEY (`UserId`, `FolderId`) USING BTREE,
 	KEY `IX_UserFolder_UserId_IsFave` (`UserId`, `IsFave`) USING BTREE,
 	FOREIGN KEY (`UserId`) REFERENCES `AppUser`(`UserId`) ON DELETE CASCADE,
 	FOREIGN KEY (`FolderId`) REFERENCES `Folder`(`FolderId`) ON DELETE CASCADE
 );
 
--- If the table already exists in your DB, apply separately:
--- ALTER TABLE UserFolder MODIFY IsFave BIT(1) NOT NULL DEFAULT b'0';
--- CREATE INDEX IX_UserFolder_UserId_IsFave ON UserFolder(UserId, IsFave);
+-- For an existing database, run Migration.sql instead of this file.
