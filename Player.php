@@ -349,7 +349,184 @@ function require_folder_param(string $raw): string {
     return $path;
 }
 
+// ---------------------------------------------------------------------------
+// "Remember me": keeps users signed in for 30 days (counted from their last visit).
+//
+// The PHP session itself expires after a short idle time on most hosts, so a separate
+// cookie holds "selector:validator". The database stores only a SHA-256 hash of the
+// validator. When the session is gone, a valid cookie signs the user back in silently.
+// Needs the AuthToken table (AddRememberMe.sql). Without it, sign-in works as before.
+// ---------------------------------------------------------------------------
+
+const REMEMBER_COOKIE = 'audiobooks_remember';
+const REMEMBER_DAYS = 30;
+
+function remember_cookie_options(int $expires): array {
+    $dir = str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'] ?? '/'));
+    $https = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+        || strtolower((string)($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '')) === 'https';
+    return [
+        'expires' => $expires,
+        'path' => rtrim($dir, '/') . '/',   // e.g. /Audio/ (also covers Audio/Auth/)
+        'secure' => $https,
+        'httponly' => true,
+        'samesite' => 'Lax',
+    ];
+}
+
+function remember_parse_cookie(): ?array {
+    $raw = (string)($_COOKIE[REMEMBER_COOKIE] ?? '');
+    if (preg_match('/^([a-f0-9]{24}):([a-f0-9]{64})$/', $raw, $m)) {
+        return ['selector' => $m[1], 'validator' => $m[2]];
+    }
+    return null;
+}
+
+function remember_clear_cookie(): void {
+    if (isset($_COOKIE[REMEMBER_COOKIE])) {
+        setcookie(REMEMBER_COOKIE, '', remember_cookie_options(time() - 3600));
+        unset($_COOKIE[REMEMBER_COOKIE]);
+    }
+}
+
+/** Create a token for the signed-in user and send the cookie. */
+function remember_issue(int $userId): void {
+    $mysqli = db_connect();
+    try {
+        // Replace any older token this browser was carrying.
+        $old = remember_parse_cookie();
+        if ($old) {
+            $stmt = $mysqli->prepare('DELETE FROM AuthToken WHERE Selector = ?');
+            $stmt->bind_param('s', $old['selector']);
+            $stmt->execute();
+            $stmt->close();
+        }
+        $mysqli->query('DELETE FROM AuthToken WHERE Expires < NOW()');
+
+        $selector = bin2hex(random_bytes(12));
+        $validator = bin2hex(random_bytes(32));
+        $hash = hash('sha256', $validator);
+        $expires = time() + REMEMBER_DAYS * 86400;
+        $ua = substr((string)($_SERVER['HTTP_USER_AGENT'] ?? ''), 0, 255);
+
+        $stmt = $mysqli->prepare('INSERT INTO AuthToken (Selector, ValidatorHash, UserId, Expires, UserAgent) VALUES (?, ?, ?, FROM_UNIXTIME(?), ?)');
+        $stmt->bind_param('ssiis', $selector, $hash, $userId, $expires, $ua);
+        $stmt->execute();
+        $stmt->close();
+
+        setcookie(REMEMBER_COOKIE, $selector . ':' . $validator, remember_cookie_options($expires));
+        $_SESSION['rememberSelector'] = $selector;
+    } finally {
+        mysqli_close($mysqli);
+    }
+}
+
+/** No session, but a remember cookie: validate it and sign the user back in. */
+function remember_restore(): bool {
+    $cookie = remember_parse_cookie();
+    if (!$cookie) {
+        remember_clear_cookie(); // malformed
+        return false;
+    }
+
+    $mysqli = db_connect();
+    try {
+        $stmt = $mysqli->prepare('
+            SELECT t.UserId, t.ValidatorHash, UNIX_TIMESTAMP(t.Expires) AS ExpiresTs, u.Email
+            FROM AuthToken t
+            JOIN AppUser u ON u.UserId = t.UserId
+            WHERE t.Selector = ?
+            LIMIT 1
+        ');
+        $stmt->bind_param('s', $cookie['selector']);
+        $stmt->execute();
+        $row = $stmt->get_result()->fetch_assoc();
+        $stmt->close();
+
+        $valid = $row
+            && (int)$row['ExpiresTs'] > time()
+            && hash_equals((string)$row['ValidatorHash'], hash('sha256', $cookie['validator']));
+
+        if (!$valid) {
+            // Unknown, expired, or wrong validator (possibly a stolen selector): drop it.
+            $stmt = $mysqli->prepare('DELETE FROM AuthToken WHERE Selector = ?');
+            $stmt->bind_param('s', $cookie['selector']);
+            $stmt->execute();
+            $stmt->close();
+            remember_clear_cookie();
+            return false;
+        }
+
+        $userId = (int)$row['UserId'];
+        session_regenerate_id(true);
+        $_SESSION['user'] = ['email' => (string)$row['Email'], 'userId' => $userId];
+        $_SESSION['rememberSelector'] = $cookie['selector'];
+
+        // Sliding window: another 30 days from today.
+        $expires = time() + REMEMBER_DAYS * 86400;
+        $stmt = $mysqli->prepare('UPDATE AuthToken SET Expires = FROM_UNIXTIME(?), LastUsed = NOW() WHERE Selector = ?');
+        $stmt->bind_param('is', $expires, $cookie['selector']);
+        $stmt->execute();
+        $stmt->close();
+        setcookie(REMEMBER_COOKIE, $cookie['selector'] . ':' . $cookie['validator'], remember_cookie_options($expires));
+
+        $stmt = $mysqli->prepare('UPDATE AppUser SET LastLoginDate = NOW() WHERE UserId = ?');
+        $stmt->bind_param('i', $userId);
+        $stmt->execute();
+        $stmt->close();
+
+        return true;
+    } finally {
+        mysqli_close($mysqli);
+    }
+}
+
+/** Log out: delete this browser's token and cookie. */
+function remember_forget(): void {
+    $selectors = [];
+    $cookie = remember_parse_cookie();
+    if ($cookie) $selectors[] = $cookie['selector'];
+    if (!empty($_SESSION['rememberSelector'])) $selectors[] = (string)$_SESSION['rememberSelector'];
+
+    if ($selectors) {
+        try {
+            $mysqli = db_connect();
+            $stmt = $mysqli->prepare('DELETE FROM AuthToken WHERE Selector = ?');
+            foreach (array_unique($selectors) as $sel) {
+                $stmt->bind_param('s', $sel);
+                $stmt->execute();
+            }
+            $stmt->close();
+            mysqli_close($mysqli);
+        } catch (Throwable $ex) {
+            error_log('[Player.php] remember_forget: ' . $ex->getMessage());
+        }
+    }
+    unset($_SESSION['rememberSelector']);
+    remember_clear_cookie();
+}
+
+// Sign back in from the cookie, or give a freshly signed-in user a cookie.
+// A database problem here never blocks the page; it just behaves like before.
+try {
+    if (!$isAuthenticated && isset($_COOKIE[REMEMBER_COOKIE])) {
+        $isAuthenticated = remember_restore();
+    } elseif ($isAuthenticated && empty($_SESSION['rememberSelector'])) {
+        $uid = get_logged_in_user_id();
+        if ($uid > 0) remember_issue($uid);
+    }
+} catch (Throwable $ex) {
+    error_log('[Player.php] remember-me: ' . $ex->getMessage());
+}
+
 $mode = $_REQUEST['mode'] ?? '';
+
+// Log out: forget this browser's token, then hand over to the normal logout page.
+if ($mode === 'logout') {
+    remember_forget();
+    header('Location: Auth/Logout.php');
+    exit;
+}
 
 // Require authentication for all API modes except authStatus
 if ($mode !== '' && $mode !== 'authStatus' && !$isAuthenticated) {
@@ -966,7 +1143,7 @@ if ($mode === 'json') {
             <a href="#" id="myBookmarksLink" onclick="openBookmarksDialog(); return false;">Bookmarks</a>
             <a href="#" id="myRatingsLink" onclick="openRatingsDialog(); return false;">Ratings</a>
             <span class="account"><?php echo htmlspecialchars((string)$_SESSION['user']['email'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?></span>
-            <a href="Auth/Logout.php">Log out</a>
+            <a href="?mode=logout">Log out</a>
         </nav>
     </header>
 

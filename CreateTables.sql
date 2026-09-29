@@ -55,4 +55,19 @@ CREATE TABLE `UserFolder` (
 	FOREIGN KEY (`FolderId`) REFERENCES `Folder`(`FolderId`) ON DELETE CASCADE
 );
 
+-- Sign-in tokens ("remember me" for 30 days)
+CREATE TABLE `AuthToken` (
+	`Selector` CHAR(24) NOT NULL,
+	`ValidatorHash` CHAR(64) NOT NULL,
+	`UserId` INT(10) UNSIGNED ZEROFILL NOT NULL,
+	`Expires` DATETIME NOT NULL,
+	`Created` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	`LastUsed` DATETIME NULL DEFAULT NULL,
+	`UserAgent` VARCHAR(255) NULL DEFAULT NULL,
+	PRIMARY KEY (`Selector`),
+	KEY `IX_AuthToken_UserId` (`UserId`),
+	KEY `IX_AuthToken_Expires` (`Expires`),
+	CONSTRAINT `FK_AuthToken_AppUser` FOREIGN KEY (`UserId`) REFERENCES `AppUser`(`UserId`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=ascii;
+
 -- For an existing database, run Migration.sql instead of this file.
