@@ -886,10 +886,10 @@ if ($mode === 'json') {
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Literata:opsz,wght@7..72,400;7..72,600&display=swap">
     <link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css">
-    <link href="Player.css?v=67" rel="stylesheet" />
+    <link href="Player.css?v=68" rel="stylesheet" />
     <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
     <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
-    <script src="Player.js?v=67"></script>
+    <script src="Player.js?v=68"></script>
 
     <?php if ($GOOGLE_CLIENT_ID !== '' && !$isAuthenticated) { ?>
         <script src="https://accounts.google.com/gsi/client" async defer></script>

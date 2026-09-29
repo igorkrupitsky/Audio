@@ -56,14 +56,15 @@ function getBasePathAndStart() {
     // picks Loud/Loudest: routing audio through it makes iPhones stop playback when
     // the screen locks, so at Normal volume we keep the plain <audio> element.
     const volumeButton = document.getElementById('volumeButton');
-    if (volumeButton) {
+    if (volumeButton && isIOS()) {
+        // iPhone/iPad (every browser there uses Safari's engine): boost can't keep
+        // playing once the screen locks, so the button isn't offered at all.
+        volumeButton.remove();
+    } else if (volumeButton) {
         volumeButton.addEventListener('click', () => {
             volumeStepIndex = (volumeStepIndex + 1) % VOLUME_STEPS.length;
             if (volumeStepIndex > 0 && !bAudioGaininitialized) {
                 initializeAudioGain();
-                if (isIOS()) {
-                    showToast('On iPhone, volume boost stops playback when the screen locks. Reload the page to turn it off completely.', 6000);
-                }
             }
             resumeAudioContext();
             applyVolumeStep();
