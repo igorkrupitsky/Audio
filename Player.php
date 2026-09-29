@@ -49,6 +49,33 @@ function db_connect(): mysqli {
 }
 
 /**
+ * The Folder table's text (titles, authors, paths) was written through latin1
+ * connections by the original code and by your other tools, so it must be read and
+ * written the same way; over utf8mb4 Cyrillic comes out as "Ð¢Ð°Ðº". Progress and
+ * bookmark data (UserFolder/AppUser) were always written over utf8mb4 and stay that way.
+ * Set DB_FOLDER_CHARSET to 'utf8mb4' in config.php only after converting the Folder data.
+ */
+function folder_charset(): string {
+    global $config;
+    return (string)($config['DB_FOLDER_CHARSET'] ?? 'latin1');
+}
+
+/** Switch the connection to the Folder table's charset; returns the previous one. */
+function use_folder_charset(mysqli $mysqli): string {
+    $previous = $mysqli->character_set_name();
+    if ($previous !== folder_charset()) {
+        $mysqli->set_charset(folder_charset());
+    }
+    return $previous;
+}
+
+function restore_charset(mysqli $mysqli, string $previous): void {
+    if ($mysqli->character_set_name() !== $previous) {
+        $mysqli->set_charset($previous);
+    }
+}
+
+/**
  * Log the real error server-side and send only a generic message to the client.
  * Both 'ok' and 'success' are set because different callers check different keys.
  */
@@ -186,23 +213,28 @@ function find_folder_rows(mysqli $mysqli, array $paths, int $userId = 0): array 
         WHERE f.FolderPath IN ($pathMarks) OR f.FolderName IN ($nameMarks)
         ORDER BY f.FolderId
     ";
-    $stmt = $mysqli->prepare($sql);
-    $params = array_merge([$userId], $paths, $names);
-    $types = 'i' . str_repeat('s', count($paths) + count($names));
-    $stmt->bind_param($types, ...$params);
-    $stmt->execute();
-    $res = $stmt->get_result();
+    $previousCharset = use_folder_charset($mysqli);
+    try {
+        $stmt = $mysqli->prepare($sql);
+        $params = array_merge([$userId], $paths, $names);
+        $types = 'i' . str_repeat('s', count($paths) + count($names));
+        $stmt->bind_param($types, ...$params);
+        $stmt->execute();
+        $res = $stmt->get_result();
 
-    $byPath = [];
-    $byName = [];
-    while ($row = $res->fetch_assoc()) {
-        $pk = path_key($row['FolderPath']);
-        if ($pk !== '' && !isset($byPath[$pk])) {
-            $byPath[$pk] = $row;
+        $byPath = [];
+        $byName = [];
+        while ($row = $res->fetch_assoc()) {
+            $pk = path_key($row['FolderPath']);
+            if ($pk !== '' && !isset($byPath[$pk])) {
+                $byPath[$pk] = $row;
+            }
+            $byName[mb_strtolower((string)$row['FolderName'], 'UTF-8')][] = $row;
         }
-        $byName[mb_strtolower((string)$row['FolderName'], 'UTF-8')][] = $row;
+        $stmt->close();
+    } finally {
+        restore_charset($mysqli, $previousCharset);
     }
-    $stmt->close();
 
     $out = [];
     foreach ($paths as $p) {
@@ -231,15 +263,20 @@ function get_folder_path_for_id(mysqli $mysqli, int $folderId): string {
     if ($folderId <= 0) {
         return '';
     }
-    $stmt = $mysqli->prepare('SELECT FolderPath FROM Folder WHERE FolderId = ? LIMIT 1');
-    $stmt->bind_param('i', $folderId);
-    $stmt->execute();
-    $stmt->bind_result($folderPath);
-    $path = '';
-    if ($stmt->fetch()) {
-        $path = (string)$folderPath;
+    $previousCharset = use_folder_charset($mysqli);
+    try {
+        $stmt = $mysqli->prepare('SELECT FolderPath FROM Folder WHERE FolderId = ? LIMIT 1');
+        $stmt->bind_param('i', $folderId);
+        $stmt->execute();
+        $stmt->bind_result($folderPath);
+        $path = '';
+        if ($stmt->fetch()) {
+            $path = (string)$folderPath;
+        }
+        $stmt->close();
+    } finally {
+        restore_charset($mysqli, $previousCharset);
     }
-    $stmt->close();
     return $path;
 }
 
@@ -638,6 +675,7 @@ if ($mode === 'json') {
     $mysqli = null;
     try {
         $mysqli = db_connect();
+        use_folder_charset($mysqli);
         $mysqli->begin_transaction();
 
         $rows = find_folder_rows($mysqli, [$folderPath]);
@@ -788,6 +826,7 @@ if ($mode === 'json') {
     $mysqli = null;
     try {
         $mysqli = db_connect();
+        use_folder_charset($mysqli); // titles/paths come from Folder
 
         $stmt = $mysqli->prepare("
             SELECT f.FolderId, f.FolderPath, NULLIF(uf.Rating, 0) AS MyRating,
@@ -847,10 +886,10 @@ if ($mode === 'json') {
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Literata:opsz,wght@7..72,400;7..72,600&display=swap">
     <link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css">
-    <link href="Player.css?v=66" rel="stylesheet" />
+    <link href="Player.css?v=67" rel="stylesheet" />
     <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
     <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
-    <script src="Player.js?v=66"></script>
+    <script src="Player.js?v=67"></script>
 
     <?php if ($GOOGLE_CLIENT_ID !== '' && !$isAuthenticated) { ?>
         <script src="https://accounts.google.com/gsi/client" async defer></script>

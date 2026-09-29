@@ -52,19 +52,31 @@ function getBasePathAndStart() {
         })
         .catch(err => showError(err.message));
 
-    // Replaced volume slider with button toggle
+    // Volume boost button. Web Audio is only switched on the first time the user
+    // picks Loud/Loudest: routing audio through it makes iPhones stop playback when
+    // the screen locks, so at Normal volume we keep the plain <audio> element.
     const volumeButton = document.getElementById('volumeButton');
     if (volumeButton) {
         volumeButton.addEventListener('click', () => {
-            initializeAudioGain();
             volumeStepIndex = (volumeStepIndex + 1) % VOLUME_STEPS.length;
+            if (volumeStepIndex > 0 && !bAudioGaininitialized) {
+                initializeAudioGain();
+                if (isIOS()) {
+                    showToast('On iPhone, volume boost stops playback when the screen locks. Reload the page to turn it off completely.', 6000);
+                }
+            }
+            resumeAudioContext();
             applyVolumeStep();
         });
 
-        // Ensure default UI/volume are applied on load
-        initializeAudioGain();
+        // Label only; no Web Audio until boost is used
         applyVolumeStep();
     }
+
+    // After unlocking the phone, wake the boost audio back up if it was used.
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') resumeAudioContext();
+    });
 
 }
 
@@ -74,16 +86,18 @@ document.addEventListener('DOMContentLoaded', function () {
     setupFaveStar();
 });
 
-let shareToastTimer = null;
-function shareLink() {
-    var o = document.querySelector('.share-link-feedback');
-    if (o == null) return;
-
+let toastTimer = null;
+function showToast(text, ms = 1800) {
+    const o = document.querySelector('.share-link-feedback');
+    if (!o) return;
+    o.textContent = text;
     o.style.display = "";
-    clearTimeout(shareToastTimer);
-    shareToastTimer = setTimeout(() => {
-        if (o) o.style.display = "none";
-    }, 1800);
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { o.style.display = "none"; }, ms);
+}
+
+function shareLink() {
+    showToast('Link copied');
 
     const url = window.location.origin + window.location.pathname + '?folder=' + encodeURIComponent((currentData && currentData.CurrentPath) || localStorage.getItem('lastFolderPath') || basePath);
 
@@ -937,7 +951,7 @@ function fetchFolderDataForEdit(path) {
 }
 
 function playAudio(audio) {
-    initializeAudioGain();
+    resumeAudioContext();
     const p = audio.play();
     if (p && typeof p.catch === 'function') {
         // Autoplay can be blocked until the user interacts with the page; that's fine,
@@ -1109,11 +1123,19 @@ function initializeAudioGain() {
     source.connect(gainNode);
     gainNode.connect(audioCtx.destination);
 
-    audioElement.addEventListener('play', () => {
-        if (audioCtx.state === 'suspended') {
-            audioCtx.resume();
-        }
-    });
+    audioElement.addEventListener('play', resumeAudioContext);
+}
+
+// Safari may leave the context 'suspended' or 'interrupted'; try to bring it back.
+function resumeAudioContext() {
+    if (audioCtx && audioCtx.state !== 'running' && audioCtx.state !== 'closed') {
+        audioCtx.resume().catch(() => { /* needs a user gesture; the next tap will do it */ });
+    }
+}
+
+function isIOS() {
+    return /iPad|iPhone|iPod/.test(navigator.userAgent)
+        || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1); // iPadOS reports as Mac
 }
 
 // NEW: apply current volume step (updates gain + UI)

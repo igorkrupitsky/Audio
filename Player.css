@@ -560,7 +560,11 @@ table.dataTable.no-footer { border-bottom: none; }
     color: #fff;
     font-size: 0.9rem;
     padding: 10px 18px;
-    border-radius: 999px;
+    border-radius: 18px;
+    width: max-content;
+    max-width: min(90vw, 420px);
+    text-align: center;
+    line-height: 1.35;
 }
 body.has-mini .toast { bottom: calc(92px + env(safe-area-inset-bottom)); }
 
