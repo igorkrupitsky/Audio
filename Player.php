@@ -176,6 +176,41 @@ function resolve_library_path(string $input): ?string {
     return $base . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $rest);
 }
 
+/**
+ * Map a FolderPath stored in the database onto a folder that exists in the current library.
+ *
+ * Rows saved on another machine keep that machine's path (e.g. "D:\Audio\Mind-Brain - AI\Book"),
+ * which resolve_library_path() rejects, so links to them fell back to the library root.
+ * Here the stored path is split into segments and its trailing parts are tried under __DIR__,
+ * longest first: "Audio/Mind-Brain - AI/Book", then "Mind-Brain - AI/Book", then "Book".
+ *
+ * Returns the server path, or '' when no matching folder exists.
+ */
+function relocate_library_path(?string $stored): string {
+    $stored = trim((string)$stored);
+    if ($stored === '' || strpos($stored, "\0") !== false) {
+        return '';
+    }
+
+    $resolved = resolve_library_path($stored);
+    if ($resolved !== null && is_dir($resolved)) {
+        return $resolved;
+    }
+
+    $segments = array_values(array_filter(
+        explode('/', str_replace('\\', '/', $stored)),
+        function ($seg) { return $seg !== '' && $seg !== '.' && $seg !== '..'; }
+    ));
+    $count = count($segments);
+    for ($i = 0; $i < $count; $i++) {
+        $candidate = __DIR__ . DIRECTORY_SEPARATOR . implode(DIRECTORY_SEPARATOR, array_slice($segments, $i));
+        if (is_dir($candidate)) {
+            return $candidate;
+        }
+    }
+    return '';
+}
+
 function path_key(?string $s): string {
     $s = str_replace('\\', '/', (string)$s);
     $s = rtrim($s, '/');
@@ -277,7 +312,7 @@ function get_folder_path_for_id(mysqli $mysqli, int $folderId): string {
     } finally {
         restore_charset($mysqli, $previousCharset);
     }
-    return $path;
+    return relocate_library_path($path);
 }
 
 function apply_folder_info(array $row, array &$folderObject): void {
@@ -1023,7 +1058,7 @@ if ($mode === 'json') {
         while ($row = $result->fetch_assoc()) {
             $items[] = [
                 'folderId' => (int)$row['FolderId'],
-                'folderPath' => encodeText($row['FolderPath']),
+                'folderPath' => encodeText(relocate_library_path($row['FolderPath'])),
                 'myRating' => $row['MyRating'] !== null ? (float)$row['MyRating'] : null,
                 'bookName' => encodeText($row['BookName']),
                 'author' => encodeText($row['Author']),
@@ -1039,6 +1074,117 @@ if ($mode === 'json') {
         exit;
     } catch (Throwable $ex) {
         json_fail(500, 'Could not load the list.', $ex);
+    } finally {
+        if ($mysqli) mysqli_close($mysqli);
+    }
+
+} elseif ($mode === 'search') {
+    // Search the whole library by folder name, title, author, and the average of all
+    // users' ratings (UserFolder.Rating). Empty criteria are ignored; the rest are ANDed.
+    header('Content-Type: application/json; charset=utf-8');
+    $userId = get_logged_in_user_id();
+    if ($userId <= 0) {
+        json_fail(401, 'Not authenticated');
+    }
+
+    $name = trim(mb_substr((string)($_GET['name'] ?? ''), 0, 200));
+    $title = trim(mb_substr((string)($_GET['title'] ?? ''), 0, 200));
+    $author = trim(mb_substr((string)($_GET['author'] ?? ''), 0, 200));
+    $minAvgRaw = (string)($_GET['minAvg'] ?? '');
+    $minAvg = (is_numeric($minAvgRaw) && (float)$minAvgRaw > 0) ? min(5.0, (float)$minAvgRaw) : null;
+
+    if ($name === '' && $title === '' && $author === '' && $minAvg === null) {
+        json_fail(400, 'Enter a folder name, a title, an author or a minimum average rating.');
+    }
+
+    $SEARCH_LIMIT = 500;
+    $like = function (string $s): string {
+        return '%' . addcslashes($s, '%_\\') . '%';
+    };
+
+    $where = [];
+    $types = 'i';
+    $params = [$userId];
+    if ($name !== '') {
+        $where[] = 'f.FolderName LIKE ?';
+        $types .= 's';
+        $params[] = $like($name);
+    }
+    if ($title !== '') {
+        $where[] = 'f.BookName LIKE ?';
+        $types .= 's';
+        $params[] = $like($title);
+    }
+    if ($author !== '') {
+        $where[] = 'f.Author LIKE ?';
+        $types .= 's';
+        $params[] = $like($author);
+    }
+    if ($minAvg !== null) {
+        $where[] = 'ROUND(a.AvgRating, 2) >= ?';
+        $types .= 'd';
+        $params[] = $minAvg;
+    }
+
+    $mysqli = null;
+    try {
+        $mysqli = db_connect();
+        use_folder_charset($mysqli); // names/authors come from Folder
+
+        $stmt = $mysqli->prepare("
+            SELECT f.FolderId, f.FolderPath, f.FolderName,
+                   IFNULL(NULLIF(f.BookName, ''), f.FolderName) AS BookName,
+                   f.Author, f.Rate, f.RateCount, f.Url,
+                   a.AvgRating, IFNULL(a.RatingCount, 0) AS UserRatingCount,
+                   NULLIF(my.Rating, 0) AS MyRating
+            FROM Folder f
+                LEFT JOIN (
+                    SELECT FolderId, AVG(Rating) AS AvgRating, COUNT(*) AS RatingCount
+                    FROM UserFolder
+                    WHERE Rating > 0
+                    GROUP BY FolderId
+                ) a ON a.FolderId = f.FolderId
+                LEFT JOIN UserFolder my ON my.FolderId = f.FolderId AND my.UserId = ?
+            WHERE " . implode(' AND ', $where) . "
+            ORDER BY a.AvgRating IS NULL, a.AvgRating DESC, BookName
+            LIMIT " . ($SEARCH_LIMIT + 1)
+        );
+        $stmt->bind_param($types, ...$params);
+        $stmt->execute();
+        $result = $stmt->get_result();
+
+        $items = [];
+        $truncated = false;
+        while ($row = $result->fetch_assoc()) {
+            if (in_array((string)$row['FolderName'], HIDDEN_FOLDER_NAMES, true)) {
+                continue;
+            }
+            if (count($items) >= $SEARCH_LIMIT) {
+                $truncated = true;
+                break;
+            }
+            $storedPath = str_replace('\\', '/', (string)$row['FolderPath']);
+            $items[] = [
+                'folderId' => (int)$row['FolderId'],
+                'folderPath' => encodeText(relocate_library_path($row['FolderPath'])),
+                'bookName' => encodeText($row['BookName']),
+                'folderName' => encodeText($row['FolderName']),
+                'author' => encodeText($row['Author']),
+                'parentName' => encodeText($storedPath !== '' ? basename(dirname($storedPath)) : ''),
+                'rate' => $row['Rate'] !== null ? (float)$row['Rate'] : null,
+                'rateCount' => $row['RateCount'] !== null ? (int)$row['RateCount'] : null,
+                'url' => encodeText($row['Url']),
+                'avgRating' => $row['AvgRating'] !== null ? round((float)$row['AvgRating'], 2) : null,
+                'userRatingCount' => (int)$row['UserRatingCount'],
+                'myRating' => $row['MyRating'] !== null ? (float)$row['MyRating'] : null
+            ];
+        }
+        $stmt->close();
+
+        echo json_encode(['ok' => true, 'results' => $items, 'truncated' => $truncated]);
+        exit;
+    } catch (Throwable $ex) {
+        json_fail(500, 'Search failed.', $ex);
     } finally {
         if ($mysqli) mysqli_close($mysqli);
     }
@@ -1063,10 +1209,10 @@ if ($mode === 'json') {
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Literata:opsz,wght@7..72,400;7..72,600&display=swap">
     <link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css">
-    <link href="Player.css?v=68" rel="stylesheet" />
+    <link href="Player.css?v=71" rel="stylesheet" />
     <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
     <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
-    <script src="Player.js?v=68"></script>
+    <script src="Player.js?v=71"></script>
 
     <?php if ($GOOGLE_CLIENT_ID !== '' && !$isAuthenticated) { ?>
         <script src="https://accounts.google.com/gsi/client" async defer></script>
@@ -1126,7 +1272,7 @@ if ($mode === 'json') {
         <symbol id="i-next" viewBox="0 0 24 24"><path d="M17.5 5.5v13" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/><path d="M5.5 6.3v11.4a.7.7 0 0 0 1.1.6l7.8-5.7a.7.7 0 0 0 0-1.2L6.6 5.7a.7.7 0 0 0-1.1.6z" fill="currentColor"/></symbol>
         <symbol id="i-back30" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4.6 13.2A7.6 7.6 0 1 0 7 6.6"/><path d="M7.6 3.2 7 6.6l3.4.8"/></g><text x="12.3" y="16" text-anchor="middle" font-size="7.4" font-weight="700" font-family="system-ui, -apple-system, Segoe UI, sans-serif" fill="currentColor">30</text></symbol>
         <symbol id="i-fwd30" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19.4 13.2A7.6 7.6 0 1 1 17 6.6"/><path d="m16.4 3.2.6 3.4-3.4.8"/></g><text x="11.7" y="16" text-anchor="middle" font-size="7.4" font-weight="700" font-family="system-ui, -apple-system, Segoe UI, sans-serif" fill="currentColor">30</text></symbol>
-        <symbol id="i-volume" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9.5h3.4L12 5.6v12.8l-4.6-3.9H4z"/><path class="wave1" d="M15.4 9.3a3.8 3.8 0 0 1 0 5.4"/><path class="wave2" d="M17.9 6.8a7.3 7.3 0 0 1 0 10.4"/></g></symbol>
+        <symbol id="i-volume" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9.5h3.4L12 5.6v12.8l-4.6-3.9H4z"/><path class="wave1" style="opacity:var(--wave1,1)" d="M15.4 9.3a3.8 3.8 0 0 1 0 5.4"/><path class="wave2" style="opacity:var(--wave2,1)" d="M17.9 6.8a7.3 7.3 0 0 1 0 10.4"/><path class="mute-x" style="opacity:var(--mute,0)" d="m16 9.5 5 5m0-5-5 5"/></g></symbol>
         <symbol id="i-star" viewBox="0 0 24 24"><path d="m12 3.6 2.6 5.2 5.8.9-4.2 4.1 1 5.7L12 16.8l-5.2 2.7 1-5.7-4.2-4.1 5.8-.9z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
         <symbol id="i-link" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/></g></symbol>
         <symbol id="i-download" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v10.5"/><path d="m7.5 10 4.5 4.5 4.5-4.5"/><path d="M5 19h14"/></g></symbol>
@@ -1140,6 +1286,7 @@ if ($mode === 'json') {
     <header class="app-bar">
         <a href="#" class="brand" onclick="loadFolder(basePath); return false;">Audiobooks</a>
         <nav class="app-nav" aria-label="Account">
+            <a href="#" id="searchLink" onclick="openSearchDialog(); return false;">Search</a>
             <a href="#" id="myBookmarksLink" onclick="openBookmarksDialog(); return false;">Bookmarks</a>
             <a href="#" id="myRatingsLink" onclick="openRatingsDialog(); return false;">Ratings</a>
             <span class="account"><?php echo htmlspecialchars((string)$_SESSION['user']['email'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?></span>
@@ -1176,11 +1323,32 @@ if ($mode === 'json') {
 
             <div class="actions">
                 <button type="button" class="act" id="speedButton" title="Playback speed"><span class="act-icon speed-value">1×</span><span class="act-label">Speed</span></button>
-                <button type="button" class="act" id="volumeButton" data-level="0" title="Volume boost"><svg class="icon act-icon"><use href="#i-volume"/></svg><span class="act-label">Normal</span></button>
+                <button type="button" class="act" id="volumeButton" data-vol="high" title="Volume"><svg class="icon act-icon"><use href="#i-volume"/></svg><span class="act-label">Volume</span></button>
                 <button type="button" class="act" id="faveStar" aria-pressed="false" title="Bookmark this book"><svg class="icon act-icon"><use href="#i-star"/></svg><span class="act-label">Bookmark</span></button>
                 <button type="button" class="act" onclick="shareLink()" title="Copy a link to this book"><svg class="icon act-icon"><use href="#i-link"/></svg><span class="act-label">Share</span></button>
                 <button type="button" class="act" id="btnCacheFolder" onclick="cacheFolder()" title="Save all chapters for offline listening"><svg class="icon act-icon i-dl"><use href="#i-download"/></svg><svg class="icon act-icon i-done"><use href="#i-check"/></svg><span class="act-label">Download</span></button>
                 <button type="button" class="act" id="editButton" onclick="OpenFolderDialog(false)" title="Edit book info"><svg class="icon act-icon"><use href="#i-pencil"/></svg><span class="act-label">Edit</span></button>
+            </div>
+
+            <div class="vol-panel" id="volumePanel" hidden>
+                <div class="vol-row">
+                    <label class="vol-label" for="volumeSlider">Volume</label>
+                    <output class="vol-readout" id="volumeReadout" for="volumeSlider">100%</output>
+                </div>
+                <input type="range" id="volumeSlider" min="0" max="200" step="1" value="100">
+                <div class="vol-scale" aria-hidden="true">
+                    <span>0</span><span class="vol-scale-mid">100%</span><span class="vol-scale-boost">Boost</span>
+                </div>
+
+                <div class="vol-speaker">
+                    <div class="vol-speaker-text">
+                        <span class="vol-speaker-title" id="speakerSwitchLabel">Speaker mode</span>
+                        <span class="vol-speaker-sub">Clearer, steadier voice on phone and laptop speakers</span>
+                    </div>
+                    <button type="button" class="switch" id="speakerSwitch" role="switch" aria-checked="false" aria-labelledby="speakerSwitchLabel"><span class="switch-knob"></span></button>
+                </div>
+
+                <button type="button" class="vol-reset" id="volumeReset" hidden>Reset to normal</button>
             </div>
         </section>
 
@@ -1253,6 +1421,34 @@ if ($mode === 'json') {
         <div class="dialog-footer">
             <button type="button" class="btn-secondary" onclick="closeBookmarksDialog()">Close</button>
         </div>
+    </dialog>
+
+    <dialog id="searchModal">
+        <button type="button" class="dialog-close" onclick="closeSearchDialog()" aria-label="Close">&times;</button>
+        <h3>Search library</h3>
+        <form id="searchForm" onsubmit="runSearch(); return false;">
+            <label class="field">Folder name
+                <input type="search" id="searchName" autocomplete="off" maxlength="200"></label>
+            <label class="field">Title
+                <input type="search" id="searchTitle" autocomplete="off" maxlength="200"></label>
+            <label class="field">Author
+                <input type="search" id="searchAuthor" autocomplete="off" maxlength="200"></label>
+            <label class="field">Average user rating
+                <select id="searchMinAvg">
+                    <option value="">Any</option>
+                    <option value="4.5">4.5 and up</option>
+                    <option value="4">4.0 and up</option>
+                    <option value="3.5">3.5 and up</option>
+                    <option value="3">3.0 and up</option>
+                    <option value="2">2.0 and up</option>
+                    <option value="1">Rated by anyone</option>
+                </select></label>
+            <div class="search-buttons">
+                <button type="button" class="btn-secondary" onclick="clearSearch()">Clear</button>
+                <button type="submit" class="btn-primary">Search</button>
+            </div>
+        </form>
+        <div id="searchResults" aria-live="polite"></div>
     </dialog>
     <?php } ?>
 

@@ -6,13 +6,13 @@ let gainNode = null;
 let audioCtx = null;
 let bAudioGaininitialized = false;
 
-// NEW: 3-step volume toggle state
-const VOLUME_STEPS = [
-    { gain: 1.0, icon: '🔈', label: 'Normal' },
-    { gain: 2.0, icon: '🔉', label: 'Loud' },
-    { gain: 5.0, icon: '🔊', label: 'Loudest' },
-];
-let volumeStepIndex = 0;
+// Volume: 0-200% slider (above 100% is boost) plus "Speaker mode" voice processing.
+// Anything past 100%, or Speaker mode, runs through Web Audio; see initializeAudioGain().
+const VOLUME_MAX = 200;
+const VOLUME_SNAP = 6;           // snap to 100% when this close to it
+let volumePct = 100;
+let speakerMode = false;
+let voiceNodes = null;           // { hp, presence, comp, boost, limiter, master } once Web Audio is on
 
 // Track current fave state for current folder
 let currentIsFave = false;
@@ -52,27 +52,8 @@ function getBasePathAndStart() {
         })
         .catch(err => showError(err.message));
 
-    // Volume boost button. Web Audio is only switched on the first time the user
-    // picks Loud/Loudest: routing audio through it makes iPhones stop playback when
-    // the screen locks, so at Normal volume we keep the plain <audio> element.
-    const volumeButton = document.getElementById('volumeButton');
-    if (volumeButton && isIOS()) {
-        // iPhone/iPad (every browser there uses Safari's engine): boost can't keep
-        // playing once the screen locks, so the button isn't offered at all.
-        volumeButton.remove();
-    } else if (volumeButton) {
-        volumeButton.addEventListener('click', () => {
-            volumeStepIndex = (volumeStepIndex + 1) % VOLUME_STEPS.length;
-            if (volumeStepIndex > 0 && !bAudioGaininitialized) {
-                initializeAudioGain();
-            }
-            resumeAudioContext();
-            applyVolumeStep();
-        });
-
-        // Label only; no Web Audio until boost is used
-        applyVolumeStep();
-    }
+    // Volume panel: slider + Speaker mode.
+    initVolumeControls();
 
     // After unlocking the phone, wake the boost audio back up if it was used.
     document.addEventListener('visibilitychange', () => {
@@ -1109,20 +1090,63 @@ function setCacheIcon(i, match) {
     if (li) li.classList.toggle('is-cached', !!match);
 }
 
+// Builds the Web Audio chain the first time it's needed (boost above 100% or
+// Speaker mode). This is one-way: once an <audio> element is routed through Web
+// Audio it stays that way, so "off" settings bypass the nodes rather than
+// disconnecting them.
+//
+//   source -> highpass -> presence EQ -> compressor -> boost -> limiter -> master -> out
+//
+// Must be called from a user gesture (click/input), or the context starts suspended.
 function initializeAudioGain() {
     if (bAudioGaininitialized) return;
     bAudioGaininitialized = true;
 
     const audioElement = document.getElementById('audioPlayer');
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    audioCtx = new Ctx();
     const source = audioCtx.createMediaElementSource(audioElement);
+
+    // Removes rumble small speakers can't reproduce anyway (frees up headroom)
+    const hp = audioCtx.createBiquadFilter();
+    hp.type = 'highpass';
+    hp.Q.value = 0.7;
+
+    // Lift the 2-4 kHz band where consonants live: better intelligibility
+    const presence = audioCtx.createBiquadFilter();
+    presence.type = 'peaking';
+    presence.frequency.value = 3000;
+    presence.Q.value = 0.9;
+
+    // Evens out the narrator: quiet syllables come up, peaks come down.
+    // (The browser adds its own make-up gain, so no extra gain is needed here.)
+    const comp = audioCtx.createDynamicsCompressor();
+    comp.attack.value = 0.003;
+    comp.release.value = 0.25;
+
+    // Volume above 100%
     gainNode = audioCtx.createGain();
 
-    // Initial gain set by applyVolumeStep()
-    gainNode.gain.value = VOLUME_STEPS[volumeStepIndex].gain;
+    // Safety limiter so boosted audio doesn't crackle
+    const limiter = audioCtx.createDynamicsCompressor();
+    limiter.threshold.value = -3;
+    limiter.knee.value = 0;
+    limiter.ratio.value = 20;
+    limiter.attack.value = 0.001;
+    limiter.release.value = 0.1;
 
-    source.connect(gainNode);
-    gainNode.connect(audioCtx.destination);
+    // Volume below 100% (applied last so the limiter always sees the full signal)
+    const master = audioCtx.createGain();
+
+    source.connect(hp);
+    hp.connect(presence);
+    presence.connect(comp);
+    comp.connect(gainNode);
+    gainNode.connect(limiter);
+    limiter.connect(master);
+    master.connect(audioCtx.destination);
+
+    voiceNodes = { hp, presence, comp, boost: gainNode, limiter, master };
 
     audioElement.addEventListener('play', resumeAudioContext);
 }
@@ -1139,20 +1163,179 @@ function isIOS() {
         || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1); // iPadOS reports as Mac
 }
 
-// NEW: apply current volume step (updates gain + UI)
-function applyVolumeStep() {
-    const step = VOLUME_STEPS[volumeStepIndex] || VOLUME_STEPS[0];
+function volumeNeedsWebAudio() {
+    return volumePct > 100 || speakerMode;
+}
 
-    if (gainNode) gainNode.gain.value = step.gain;
+function initVolumeControls() {
+    const button = document.getElementById('volumeButton');
+    const panel = document.getElementById('volumePanel');
+    if (!button) return;
 
-    const volumeButton = document.getElementById('volumeButton');
-    if (volumeButton) {
-        volumeButton.dataset.level = String(volumeStepIndex);
-        volumeButton.classList.toggle('is-on', volumeStepIndex > 0);
-        volumeButton.title = 'Volume boost: ' + step.label;
-        const label = volumeButton.querySelector('.act-label');
-        if (label) label.textContent = step.label;
+    if (isIOS()) {
+        // iPhone/iPad (every browser there uses Safari's engine): Web Audio stops
+        // playback when the screen locks, and audio.volume is read-only, so neither
+        // the slider nor Speaker mode can work. Use the hardware buttons instead.
+        button.remove();
+        if (panel) panel.remove();
+        return;
     }
+
+    // Restore saved settings (this device only)
+    try {
+        const v = parseInt(localStorage.getItem('volumePct'), 10);
+        if (!isNaN(v)) volumePct = Math.max(0, Math.min(VOLUME_MAX, v));
+        speakerMode = localStorage.getItem('speakerMode') === '1';
+    } catch (e) { /* ignore */ }
+
+    // Web Audio has to start from a user gesture. If the saved settings need it,
+    // switch it on at the first tap/keypress; until then play at plain 100%.
+    if (volumeNeedsWebAudio()) {
+        const startOnGesture = () => {
+            document.removeEventListener('click', startOnGesture, true);
+            document.removeEventListener('keydown', startOnGesture, true);
+            if (volumeNeedsWebAudio() && !bAudioGaininitialized) initializeAudioGain();
+            resumeAudioContext();
+            applyVolume();
+        };
+        document.addEventListener('click', startOnGesture, true);
+        document.addEventListener('keydown', startOnGesture, true);
+    }
+
+    button.setAttribute('aria-expanded', 'false');
+    if (panel) button.setAttribute('aria-controls', 'volumePanel');
+    button.addEventListener('click', () => toggleVolumePanel());
+
+    const slider = document.getElementById('volumeSlider');
+    if (slider) {
+        slider.max = String(VOLUME_MAX);
+        slider.value = String(volumePct);
+        slider.addEventListener('input', () => {
+            let v = parseInt(slider.value, 10) || 0;
+            if (Math.abs(v - 100) <= VOLUME_SNAP) v = 100;   // easy to get back to normal
+            setVolume(v, false);
+        });
+        slider.addEventListener('change', () => saveVolumeSettings());
+    }
+
+    const speakerSwitch = document.getElementById('speakerSwitch');
+    if (speakerSwitch) {
+        speakerSwitch.addEventListener('click', () => {
+            speakerMode = !speakerMode;
+            if (speakerMode && !bAudioGaininitialized) initializeAudioGain();
+            resumeAudioContext();
+            applyVolume();
+            saveVolumeSettings();
+        });
+    }
+
+    const reset = document.getElementById('volumeReset');
+    if (reset) {
+        reset.addEventListener('click', () => {
+            speakerMode = false;
+            setVolume(100, true);
+        });
+    }
+
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && panel && !panel.hidden) {
+            toggleVolumePanel(false);
+            button.focus();
+        }
+    });
+
+    applyVolume();
+}
+
+function toggleVolumePanel(open) {
+    const button = document.getElementById('volumeButton');
+    const panel = document.getElementById('volumePanel');
+    if (!panel || !button) return;
+    const show = typeof open === 'boolean' ? open : panel.hidden;
+    panel.hidden = !show;
+    button.setAttribute('aria-expanded', String(show));
+    button.classList.toggle('is-open', show);
+    if (show) panel.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
+function setVolume(pct, save) {
+    volumePct = Math.max(0, Math.min(VOLUME_MAX, Math.round(pct)));
+    if (volumeNeedsWebAudio() && !bAudioGaininitialized) initializeAudioGain();
+    resumeAudioContext();
+    applyVolume();
+    if (save) saveVolumeSettings();
+}
+
+function saveVolumeSettings() {
+    try {
+        localStorage.setItem('volumePct', String(volumePct));
+        localStorage.setItem('speakerMode', speakerMode ? '1' : '0');
+    } catch (e) { /* ignore */ }
+}
+
+// Applies volumePct/speakerMode to the audio and updates the button + panel.
+function applyVolume() {
+    const audio = document.getElementById('audioPlayer');
+    const level = volumePct / 100;
+
+    if (voiceNodes && audioCtx) {
+        // Web Audio is on: all volume handling happens in the graph.
+        const t = audioCtx.currentTime;
+        const ramp = (param, value) => param.setTargetAtTime(value, t, 0.03); // no clicks
+        const n = voiceNodes;
+
+        if (audio) audio.volume = 1;
+        ramp(n.boost.gain, Math.max(level, 1));
+        ramp(n.master.gain, Math.min(level, 1));
+
+        // Speaker mode on: voice chain. Off: each stage becomes a pass-through.
+        ramp(n.hp.frequency, speakerMode ? 120 : 10);
+        ramp(n.presence.gain, speakerMode ? 4 : 0);
+        ramp(n.comp.threshold, speakerMode ? -26 : 0);
+        ramp(n.comp.knee, speakerMode ? 10 : 0);
+        ramp(n.comp.ratio, speakerMode ? 4 : 1);
+    } else if (audio) {
+        // Plain <audio> element: only 0-100% is possible (and all that's needed).
+        audio.volume = Math.min(level, 1);
+    }
+
+    updateVolumeUI();
+}
+
+function updateVolumeUI() {
+    const pctText = volumePct + '%';
+
+    const button = document.getElementById('volumeButton');
+    if (button) {
+        let icon = 'high';
+        if (volumePct === 0) icon = 'mute';
+        else if (volumePct < 50) icon = 'low';
+        button.dataset.vol = icon;
+        button.classList.toggle('is-on', volumePct > 100 || speakerMode);
+        button.classList.toggle('is-speaker', speakerMode);
+        const label = button.querySelector('.act-label');
+        if (label) label.textContent = speakerMode ? 'Speaker' : (volumePct === 100 ? 'Volume' : pctText);
+        button.title = 'Volume: ' + pctText + (speakerMode ? ', Speaker mode on' : '');
+    }
+
+    const slider = document.getElementById('volumeSlider');
+    if (slider) {
+        if (parseInt(slider.value, 10) !== volumePct) slider.value = String(volumePct);
+        const pos = (volumePct / VOLUME_MAX) * 100;
+        slider.style.setProperty('--pct', pos + '%');
+        slider.style.setProperty('--fill', Math.min(pos, 50) + '%');
+        slider.setAttribute('aria-valuetext', pctText + (volumePct > 100 ? ' (boosted)' : ''));
+        slider.classList.toggle('is-boosting', volumePct > 100);
+    }
+
+    const readout = document.getElementById('volumeReadout');
+    if (readout) readout.textContent = pctText;
+
+    const speakerSwitch = document.getElementById('speakerSwitch');
+    if (speakerSwitch) speakerSwitch.setAttribute('aria-checked', String(speakerMode));
+
+    const reset = document.getElementById('volumeReset');
+    if (reset) reset.hidden = (volumePct === 100 && !speakerMode);
 }
 
 // Bookmarks dialog functions
@@ -1224,7 +1407,7 @@ async function openUserListDialog(opts) {
                 const urlHtml = url ? '<a href="' + escapeHtml(url) + '" target="_blank" rel="noopener noreferrer" title="Open external link">&#128279;</a>' : '';
 
                 return [
-                    '<a href="#" class="bookmark-link" data-path="' + escapeHtml(b.folderPath) + '">' + escapeHtml(b.bookName) + '</a>',
+                    bookmarkLinkHtml(b),
                     escapeHtml(b.author || ''),
                     escapeHtml(b.parentName || ''),
                     { display: escapeHtml(ratingDisplay + rateCountDisplay), sort: b.rate !== null ? b.rate : 0 },
@@ -1292,7 +1475,7 @@ async function openUserListDialog(opts) {
             listHtml += `
 <li class="userlist-item">
   <div class="userlist-row">
-    <a href="#" class="bookmark-link" data-path="${escapeHtml(b.folderPath)}">${escapeHtml(b.bookName)}</a>
+    ${bookmarkLinkHtml(b)}
     <span class="userlist-link">${urlHtml}</span>
   </div>
   <div class="userlist-meta">
@@ -1329,12 +1512,188 @@ async function openUserListDialog(opts) {
     }
 }
 
+// Book title in the Bookmarks/Ratings list. The server sends an empty folderPath when the
+// folder no longer exists in the library, so show plain text instead of a dead link.
+function bookmarkLinkHtml(b) {
+    const name = escapeHtml(b.bookName || '');
+    if (!b.folderPath) {
+        return '<span class="bookmark-missing" title="Folder not found in the library">' + name + '</span>';
+    }
+    return '<a href="#" class="bookmark-link" data-path="' + escapeHtml(b.folderPath) + '">' + name + '</a>';
+}
+
 function closeBookmarksDialog() {
     // Destroy DataTable before closing to clean up
     if (typeof $ !== 'undefined' && $.fn.DataTable && $.fn.DataTable.isDataTable('#bookmarksTable')) {
         $('#bookmarksTable').DataTable().destroy();
     }
     document.getElementById('bookmarksModal').close();
+}
+
+// ---------------------------------------------------------------------------
+// Library search: folder name, title, author, and average user rating
+// (the average of every user's UserFolder.Rating for that book).
+// ---------------------------------------------------------------------------
+let searchRequestSeq = 0;
+
+function openSearchDialog() {
+    const modal = document.getElementById('searchModal');
+    if (!modal) return;
+    if (!modal.open) modal.showModal();
+    const name = document.getElementById('searchName');
+    if (name) { name.focus(); name.select(); }
+}
+
+// Results stay in place, so reopening the dialog shows the last search.
+function closeSearchDialog() {
+    document.getElementById('searchModal').close();
+}
+
+function destroySearchTable() {
+    if (typeof $ !== 'undefined' && $.fn.DataTable && $.fn.DataTable.isDataTable('#searchTable')) {
+        $('#searchTable').DataTable().destroy();
+    }
+}
+
+function clearSearch() {
+    searchRequestSeq++; // drop any search still in flight
+    document.getElementById('searchForm').reset();
+    destroySearchTable();
+    document.getElementById('searchResults').innerHTML = '';
+    document.getElementById('searchName').focus();
+}
+
+async function runSearch() {
+    const name = document.getElementById('searchName').value.trim();
+    const title = document.getElementById('searchTitle').value.trim();
+    const author = document.getElementById('searchAuthor').value.trim();
+    const minAvg = document.getElementById('searchMinAvg').value;
+    const results = document.getElementById('searchResults');
+
+    destroySearchTable();
+    if (!name && !title && !author && !minAvg) {
+        results.innerHTML = '<p class="search-note">Enter a folder name, a title or an author, or pick an average rating.</p>';
+        return;
+    }
+
+    const seq = ++searchRequestSeq;
+    results.innerHTML = '<p class="search-note">Searching…</p>';
+
+    try {
+        const params = new URLSearchParams({ mode: 'search', name, title, author, minAvg });
+        const r = await fetch('?' + params.toString(), { cache: 'no-store' });
+        const data = await r.json();
+        if (seq !== searchRequestSeq) return; // a newer search replaced this one
+
+        if (!data.ok) {
+            results.innerHTML = '<p class="search-error">' + escapeHtml(data.error || 'Search failed.') + '</p>';
+            return;
+        }
+        renderSearchResults(data.results || [], !!data.truncated);
+    } catch (e) {
+        if (seq !== searchRequestSeq) return;
+        results.innerHTML = '<p class="search-error">Search failed: ' + escapeHtml(e.message) + '</p>';
+    }
+}
+
+// Stars plus "4.3 (3)": the average and how many users rated it.
+function avgRatingHtml(b) {
+    if (b.avgRating === null) return '';
+    const count = b.userRatingCount === 1 ? '1 rating' : b.userRatingCount + ' ratings';
+    return ratingImgHtml(b.avgRating)
+        + ' <span class="muted" title="' + escapeHtml(count) + '">' + b.avgRating.toFixed(1)
+        + ' (' + b.userRatingCount + ')</span>';
+}
+
+function renderSearchResults(items, truncated) {
+    const results = document.getElementById('searchResults');
+
+    if (!items.length) {
+        results.innerHTML = '<p class="search-note">No books match that search.</p>';
+        return;
+    }
+
+    let summary = items.length.toLocaleString() + (items.length === 1 ? ' book found' : ' books found');
+    if (truncated) summary += ' &mdash; showing the first ' + items.length.toLocaleString() + ', narrow the search to see the rest';
+    const summaryHtml = '<p class="search-note">' + summary + '</p>';
+
+    const publicRating = b => (b.rate !== null ? b.rate.toFixed(1) : '')
+        + (b.rateCount !== null ? ' (' + b.rateCount.toLocaleString() + ')' : '');
+    const linkHtml = b => {
+        const url = safeUrl(b.url);
+        return url ? '<a class="AmazonLink" href="' + escapeHtml(url) + '" target="_blank" rel="noopener noreferrer" title="Book page">&#128279;</a>' : '';
+    };
+
+    const hasDataTables = typeof $ !== 'undefined' && $.fn.DataTable;
+    if (window.innerWidth > 1000 && hasDataTables) {
+        results.innerHTML = summaryHtml
+            + '<table id="searchTable" class="display" style="width:100%"><thead><tr>'
+            + '<th>Book Name</th><th>Author</th><th>Folder</th><th>Avg user rating</th>'
+            + '<th>My Rating</th><th>Public rating</th><th>Link</th>'
+            + '</tr></thead><tbody></tbody></table>';
+
+        const tableData = items.map(b => [
+            bookmarkLinkHtml(b),
+            escapeHtml(b.author || ''),
+            escapeHtml(b.parentName || ''),
+            { display: avgRatingHtml(b), sort: b.avgRating !== null ? b.avgRating : -1 },
+            { display: b.myRating !== null ? ratingImgHtml(b.myRating) : '', sort: b.myRating !== null ? b.myRating : -1 },
+            { display: escapeHtml(publicRating(b)), sort: b.rate !== null ? b.rate : -1 },
+            linkHtml(b)
+        ]);
+
+        const sortable = {
+            type: 'num',
+            render: function (data, type) {
+                return (type === 'sort' || type === 'type') ? data.sort : data.display;
+            }
+        };
+
+        $('#searchTable').DataTable({
+            data: tableData,
+            pageLength: 25,
+            lengthMenu: [[10, 25, 50, 100, -1], [10, 25, 50, 100, "All"]],
+            order: [], // keep the server's order: best average rating first
+            columnDefs: [
+                { orderable: false, targets: [6] },
+                Object.assign({ targets: [3, 4, 5] }, sortable)
+            ],
+            language: { search: "Filter:", lengthMenu: "Show _MENU_ entries" }
+        });
+    } else {
+        let html = summaryHtml + '<ul class="userlist">';
+        items.forEach(b => {
+            const pr = publicRating(b);
+            const avg = avgRatingHtml(b);
+            html += `
+<li class="userlist-item">
+  <div class="userlist-row">
+    ${bookmarkLinkHtml(b)}
+    <span class="userlist-link">${linkHtml(b)}</span>
+  </div>
+  <div class="userlist-meta">
+    ${b.author ? `<div><strong>Author:</strong> ${escapeHtml(b.author)}</div>` : ''}
+    ${b.parentName ? `<div><strong>Folder:</strong> ${escapeHtml(b.parentName)}</div>` : ''}
+    ${avg ? `<div><strong>Avg user rating:</strong> ${avg}</div>` : ''}
+    ${b.myRating !== null ? `<div><strong>My Rating:</strong> ${ratingImgHtml(b.myRating)}</div>` : ''}
+    ${pr ? `<div><strong>Public rating:</strong> ${escapeHtml(pr)}</div>` : ''}
+  </div>
+</li>`;
+        });
+        results.innerHTML = html + '</ul>';
+    }
+
+    // One handler for both layouts (DataTables redraws rows when paging/sorting).
+    results.onclick = function (e) {
+        const a = e.target.closest('.bookmark-link');
+        if (!a || !results.contains(a)) return;
+        e.preventDefault();
+        const path = a.dataset.path;
+        if (path) {
+            closeSearchDialog();
+            loadFolder(path);
+        }
+    };
 }
 
 // Escapes all five HTML-significant characters, so the result is safe both as
