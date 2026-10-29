@@ -6,6 +6,7 @@ if (session_status() !== PHP_SESSION_ACTIVE) {
 }
 
 $config = require __DIR__ . '/config.php';
+require_once __DIR__ . '/AudioChapters.php';
 $DB_HOST = $config['DB_HOST'];
 $DB_NAME = $config['DB_NAME'];
 $DB_USER = $config['DB_USER'];
@@ -20,6 +21,42 @@ $ADMIN_EMAILS = array_map('strtolower', array_map('trim', (array)($config['ADMIN
 
 // Folder names that are never shown in listings.
 const HIDDEN_FOLDER_NAMES = ['images', 'bin', 'obj', '.vs'];
+
+/**
+ * Names inside a folder, in natural order ("2" before "10"), case-insensitive.
+ * (scandir instead of glob: glob treats [ ] in folder names as patterns and is
+ * case-sensitive on Linux, so "Book [Unabridged]" and "01.MP3" used to be missed.)
+ */
+function list_folder_entries(string $dir): array {
+    $names = @scandir($dir);
+    if ($names === false) {
+        return [];
+    }
+    $names = array_values(array_filter($names, function ($n) { return $n !== '.' && $n !== '..'; }));
+    usort($names, 'strnatcasecmp');
+    return $names;
+}
+
+/** A folder is shown when it holds audio files or further folders. Stops at the first hit. */
+function folder_is_listable(string $dir): bool {
+    $dh = @opendir($dir);
+    if (!$dh) {
+        return false;
+    }
+    try {
+        while (($name = readdir($dh)) !== false) {
+            if ($name === '.' || $name === '..') {
+                continue;
+            }
+            if (is_audio_filename($name) || is_dir($dir . '/' . $name)) {
+                return true;
+            }
+        }
+        return false;
+    } finally {
+        closedir($dh);
+    }
+}
 
 // Check if user is authenticated
 $isAuthenticated = isset($_SESSION['user']) && is_array($_SESSION['user']) && (string)($_SESSION['user']['email'] ?? '') !== '';
@@ -595,7 +632,8 @@ if ($mode === 'json') {
         "PubYear" => "",
         "PubDate" => "",
         "Subfolders" => [],
-        "Mp3Files" => []
+        "Mp3Files" => [],
+        "Chapters" => new stdClass()
     ];
 
     try {
@@ -605,17 +643,15 @@ if ($mode === 'json') {
         }
 
         $subfolderObjects = [];
-        $subfolders = array_filter(glob($folderPath . '/*') ?: [], 'is_dir');
+        $entries = list_folder_entries($folderPath);
 
-        foreach ($subfolders as $subfolder) {
-            if (in_array(basename($subfolder), HIDDEN_FOLDER_NAMES, true)) {
+        foreach ($entries as $name) {
+            $subfolder = $folderPath . '/' . $name;
+            if (in_array($name, HIDDEN_FOLDER_NAMES, true) || !is_dir($subfolder)) {
                 continue;
             }
 
-            $hasSubfolders = count(array_filter(glob($subfolder . '/*') ?: [], 'is_dir')) > 0;
-            $hasMp3 = count(glob($subfolder . '/*.mp3') ?: []) > 0;
-
-            if ($hasSubfolders || $hasMp3) {
+            if (folder_is_listable($subfolder)) {
                 $normalizedPath = (PHP_OS_FAMILY === 'Windows') ? str_replace('/', '\\', $subfolder) : $subfolder;
                 $subfolderObjects[$normalizedPath] = [
                     "Folder" => encodeText($normalizedPath),
@@ -633,23 +669,42 @@ if ($mode === 'json') {
         }
 
         if (count($subfolderObjects) === 0) {
-            $files = array_merge(
-                glob($folderPath . '/*.mp3') ?: [],
-                glob($folderPath . '/*.pdf') ?: [],
-                glob($folderPath . '/*.txt') ?: []
-            );
+            // Audio first (in name order), then PDFs and text files. "Mp3Files" keeps its old
+            // name for compatibility but now holds every supported audio type.
+            $audio = [];
+            $docs = ['pdf' => [], 'txt' => []];
+            foreach ($entries as $name) {
+                $lower = strtolower($name);
+                if ($lower === 'index.txt' || $lower === 'rating.txt' || !is_file($folderPath . '/' . $name)) {
+                    continue;
+                }
+                $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
+                if (is_audio_filename($name)) {
+                    $audio[] = $name;
+                } elseif (isset($docs[$ext])) {
+                    $docs[$ext][] = $name;
+                }
+            }
 
             $webPaths = [];
-            foreach ($files as $file) {
-                $sFileName = strtolower(basename($file));
-                if ($sFileName !== 'index.txt' && $sFileName !== 'rating.txt') {
-                    $rel = substr($file, strlen($folderPath));
-                    $rel = ltrim($rel, DIRECTORY_SEPARATOR . '/');
-                    $rel = str_replace(['\\', '/'], '/', $rel); // Normalize for web
-                    $webPaths[] = encodeText($rel);
+            $chapters = [];
+            foreach (array_merge($audio, $docs['pdf'], $docs['txt']) as $name) {
+                $web = encodeText($name);
+                $webPaths[] = $web;
+                if (is_audio_filename($name)) {
+                    $marks = read_audio_chapters($folderPath . '/' . $name);
+                    if ($marks) {
+                        foreach ($marks as &$m) {
+                            $m['title'] = encodeText($m['title']);
+                        }
+                        unset($m);
+                        $chapters[$web] = $marks;
+                    }
                 }
             }
             $result['Mp3Files'] = $webPaths;
+            // Chapter markers inside files: { "Book.m4b": [{title, start, end}, ...] }
+            $result['Chapters'] = (object)$chapters;
         }
 
         // One connection, one query for the current folder and all its subfolders.
@@ -1209,10 +1264,10 @@ if ($mode === 'json') {
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Literata:opsz,wght@7..72,400;7..72,600&display=swap">
     <link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css">
-    <link href="Player.css?v=71" rel="stylesheet" />
+    <link href="Player.css?v=73" rel="stylesheet" />
     <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
     <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
-    <script src="Player.js?v=71"></script>
+    <script src="Player.js?v=73"></script>
 
     <?php if ($GOOGLE_CLIENT_ID !== '' && !$isAuthenticated) { ?>
         <script src="https://accounts.google.com/gsi/client" async defer></script>
@@ -1299,8 +1354,6 @@ if ($mode === 'json') {
         <div id="ratings" class="book-header"></div>
 
         <section id="playerControl" class="player" style="display:none" aria-label="Player">
-            <!-- The select keeps the track order/state for the script; the chapter list is the visible picker. -->
-            <select id="trackSelector" hidden aria-hidden="true" tabindex="-1"></select>
             <audio id="audioPlayer" preload="metadata"></audio>
 
             <p class="np-chapter" id="npIndex"></p>

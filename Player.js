@@ -30,6 +30,41 @@ let audioLoadToken = 0;          // ignore stale setAudioFile calls
 let currentObjectUrl = null;     // blob URL of a cached track, revoked on the next switch
 let folderRequestSeq = 0;        // ignore stale folder listings (out-of-order responses)
 
+// Playlist: one entry per chapter. An MP3 (or any file without chapter markers) is one
+// entry; an M4B/M4A/Opus/Ogg file with chapter markers adds one entry per marker, all
+// pointing at the same file. Times are seconds within the file.
+let tracks = [];                 // { file, start, end (null = end of file), title, num }
+let currentTrack = -1;           // index into tracks of the chapter being played
+let loadedFile = '';             // file currently in the <audio> element; progress is saved against it
+let seekPending = false;         // a new file is loading and will jump to its start position
+
+// Audio types the player lists. Keep in sync with AUDIO_EXTENSIONS in AudioChapters.php.
+const AUDIO_TYPES = {
+    mp3: 'audio/mpeg',
+    m4b: 'audio/mp4',
+    m4a: 'audio/mp4',
+    aac: 'audio/aac',
+    opus: 'audio/ogg; codecs=opus',
+    ogg: 'audio/ogg'
+};
+
+function fileExt(path) {
+    const m = String(path || '').match(/\.([a-z0-9]+)$/i);
+    return m ? m[1].toLowerCase() : '';
+}
+
+function isAudioFile(path) {
+    return Object.prototype.hasOwnProperty.call(AUDIO_TYPES, fileExt(path));
+}
+
+// Some formats don't play everywhere (e.g. Ogg on older iPhones); ask the browser.
+function canPlayFile(path) {
+    const type = AUDIO_TYPES[fileExt(path)];
+    if (!type) return false;
+    const probe = document.getElementById('audioPlayer') || document.createElement('audio');
+    return probe.canPlayType(type) !== '';
+}
+
 function getBasePathAndStart() {
 
     // if ('serviceWorker' in navigator) {
@@ -302,9 +337,9 @@ function renderBreadcrumb(data) {
 function renderContent(data) {
     const container = document.getElementById('content');
     let html = '';
-    const selector = document.getElementById("trackSelector");
     const playerControl = document.getElementById("playerControl");
-    selector.length = 0;
+    tracks = [];
+    currentTrack = -1;
     playerControl.style.display = "none";
     document.body.classList.toggle('view-player', data.Subfolders.length === 0 && data.Mp3Files.length > 0);
 
@@ -443,40 +478,78 @@ function renderContent(data) {
         playerControl.style.display = "";
         sCurrentFolder = data.CurrentFolder;
 
-        let audioCount = 0;
-        data.Mp3Files.forEach((f, index) => {
-            const name = f.split('/').pop();
-            if (sCurrentFolder !== "") {
-                f = sCurrentFolder + "/" + f;
+        const chapterMap = data.Chapters || {};
+        const audioNames = data.Mp3Files.filter(isAudioFile);
+        // Several files, and at least one of them has its own chapters (e.g. Part 1.m4b,
+        // Part 2.m4b): put the file name above each file's chapters.
+        const showFileHeadings = audioNames.length > 1 && audioNames.some(n => (chapterMap[n] || []).length > 1);
+
+        const trackHtml = (t, i) =>
+            `<li class="file" data-track="${i}" data-file="${escapeHtml(t.file)}">`
+            + `<span class="ch-num">${escapeHtml(t.num)}</span>`
+            + `<svg class="icon ch-check" aria-hidden="true"><use href="#i-check"/></svg>`
+            + `<span class="ch-title">${escapeHtml(t.title)}</span>`
+            + `<span class="downloaded" title="Available offline"><svg class="icon icon-sm"><use href="#i-saved"/></svg></span>`
+            + `<span class="ch-progress" aria-hidden="true"></span>`
+            + `</li>`;
+
+        data.Mp3Files.forEach((name, index) => {
+            const base = name.split('/').pop();
+            const f = sCurrentFolder !== "" ? sCurrentFolder + "/" + name : name;
+            const ch = chapterParts(base, index);
+
+            if (!isAudioFile(name) || !canPlayFile(name)) {
+                // PDFs/text files open in a new tab; so do audio files this browser can't play.
+                const unsupported = isAudioFile(name);
+                html += `<li class="file is-doc${unsupported ? ' is-unsupported' : ''}" data-path="${escapeHtml(f)}"`
+                    + (unsupported ? ` title="This browser can't play .${escapeHtml(ch.ext)} files"` : '') + `>`
+                    + `<span class="ch-num"></span>`
+                    + `<span class="ch-title">${escapeHtml(ch.title)}`
+                    + (unsupported ? `<span class="ch-note">Can't play in this browser</span>` : '') + `</span>`
+                    + `<span class="file-kind">${escapeHtml(ch.ext.toUpperCase())}</span>`
+                    + `</li>`;
+                return;
             }
-            const isAudio = f.toLowerCase().endsWith(".mp3");
-            const ch = chapterParts(name, index);
 
-            html += `<li class="file${isAudio ? '' : ' is-doc'}" data-path="${escapeHtml(f)}" data-index="${index}">`
-                + `<span class="ch-num">${escapeHtml(ch.num)}</span>`
-                + `<svg class="icon ch-check" aria-hidden="true"><use href="#i-check"/></svg>`
-                + `<span class="ch-title">${escapeHtml(ch.title)}</span>`
-                + (isAudio
-                    ? `<span class="downloaded" title="Available offline"><svg class="icon icon-sm"><use href="#i-saved"/></svg></span>`
-                    : `<span class="file-kind">${escapeHtml(ch.ext.toUpperCase())}</span>`)
-                + `<span class="ch-progress" aria-hidden="true"></span>`
-                + `</li>`;
-
-            if (isAudio) {
-                audioCount++;
-                const option = document.createElement("option");
-                option.value = f;
-                option.textContent = ch.title;
-                selector.appendChild(option);
+            const marks = chapterMap[name] || [];
+            if (marks.length > 1) {
+                if (showFileHeadings) {
+                    html += `<li class="file-group">${escapeHtml(ch.title)}</li>`;
+                }
+                marks.forEach((m, j) => {
+                    const t = {
+                        file: f,
+                        start: Number(m.start) || 0,
+                        end: Number.isFinite(Number(m.end)) && Number(m.end) > 0 ? Number(m.end) : null,
+                        title: m.title || ('Chapter ' + (j + 1)),
+                        num: String(tracks.length + 1).padStart(2, '0')
+                    };
+                    tracks.push(t);
+                    html += trackHtml(t, tracks.length - 1);
+                });
+                // The last marker runs to the end of the file, whatever the header says.
+                tracks[tracks.length - 1].end = null;
+            } else {
+                const t = { file: f, start: 0, end: null, title: ch.title, num: ch.num };
+                tracks.push(t);
+                html += trackHtml(t, tracks.length - 1);
             }
         });
 
-        container.innerHTML = `<h3 class="list-heading">${audioCount} ${audioCount === 1 ? 'chapter' : 'chapters'}</h3>`
+        const n = tracks.length;
+        let heading = `${n} ${n === 1 ? 'chapter' : 'chapters'}`;
+        if (n === 0) {
+            // Nothing playable here (only documents, or formats this browser can't play).
+            playerControl.style.display = "none";
+            document.body.classList.remove('view-player');
+            heading = audioNames.length ? "This browser can't play these files" : 'Files';
+        }
+        container.innerHTML = `<h3 class="list-heading">${heading}</h3>`
             + '<ul class="chapter-list">' + html + "</ul>";
         loadTracks(data.CurrentPath);
         checkFolderCache();
     } else {
-        container.innerHTML = '<p class="empty">This folder has no audiobooks or MP3 files yet.</p>';
+        container.innerHTML = '<p class="empty">This folder has no audiobooks or audio files yet.</p>';
     }
 
     // Keep external-link clicks from also opening the folder
@@ -524,6 +597,18 @@ function showError(msg) {
 }
 
 document.addEventListener('click', function (e) {
+    // A chapter in the list: play it from its start.
+    const trackEl = e.target.closest('#content [data-track]');
+    if (trackEl) {
+        const i = parseInt(trackEl.dataset.track, 10);
+        if (tracks[i]) {
+            pendingResumeFolder = null; // user's choice wins over a still-loading resume
+            playTrack(i);
+            if (playingFolderPath) setServerProgress(playingFolderPath, Math.floor(tracks[i].start), tracks[i].file);
+        }
+        return;
+    }
+
     const target = e.target.closest('[data-path]');
     if (!target) return;
 
@@ -532,18 +617,7 @@ document.addEventListener('click', function (e) {
     if (target.classList.contains('folder') || target.classList.contains('crumb')) {
         loadFolder(path);
     } else if (target.classList.contains('file')) {
-        if (!path.toLowerCase().endsWith(".mp3")) {
-            window.open(path);
-        } else {
-            const selector = document.getElementById("trackSelector");
-            selector.value = path;
-            if (selector.selectedIndex !== -1) {
-                const audio = document.getElementById("audioPlayer");
-                pendingResumeFolder = null; // user's choice wins over a still-loading resume
-                setAudioFileAndPlay(audio, selector.value);
-                if (playingFolderPath) setServerProgress(playingFolderPath, 0, selector.value);
-            }
-        }
+        window.open(path); // PDFs, text files, audio this browser can't play
     }
 });
 
@@ -602,28 +676,14 @@ function initPlayerOnce() {
     playerInitialized = true;
 
     const audio = document.getElementById("audioPlayer");
-    const selector = document.getElementById("trackSelector");
-    if (!audio || !selector) return;
+    if (!audio) return;
 
     initPlayerUI(audio);
 
-    // User picked a track from the dropdown: start it from the beginning.
-    selector.addEventListener("change", () => {
-        pendingResumeFolder = null;
-        setAudioFileAndPlay(audio, selector.value);
-        if (playingFolderPath) {
-            setServerProgress(playingFolderPath, 0, selector.value);
-        }
-    });
-
-    // Auto-play next track
+    // End of a file: continue with the next file. (Chapters inside one file just play on.)
     audio.addEventListener("ended", () => {
-        const currentIndex = selector.selectedIndex;
-        if (currentIndex >= 0 && currentIndex < selector.options.length - 1) {
-            const nextOption = selector.options[currentIndex + 1];
-            selector.value = nextOption.value;
-            setAudioFileAndPlay(audio, nextOption.value);
-        }
+        const next = lastTrackOfFile(loadedFile) + 1;
+        if (next > 0 && next < tracks.length) playTrack(next);
     });
 
     // Save progress every 5 seconds while playing, and right away on pause.
@@ -636,29 +696,27 @@ function initPlayerOnce() {
 
 function saveCurrentProgress(evenIfPaused) {
     const audio = document.getElementById("audioPlayer");
-    const selector = document.getElementById("trackSelector");
-    if (!audio || !audio.src || !playingFolderPath) return;
-    if (audio.readyState < 1) return; // a new track is still loading; position isn't meaningful yet
+    if (!audio || !audio.src || !playingFolderPath || !loadedFile) return;
+    if (audio.readyState < 1 || seekPending) return; // a new file is still loading; position isn't meaningful yet
     if (audio.paused && !evenIfPaused) return;
     // Don't save while a resume is still loading, or we'd overwrite the saved spot with 0.
     if (pendingResumeFolder === playingFolderPath) return;
 
+    // Position within the file (for an M4B that's the position in the whole book).
     const secs = Math.floor(audio.currentTime || 0);
-    const fileUrl = selector && selector.value ? selector.value : '';
-    const key = playingFolderPath + '|' + fileUrl + '|' + secs;
+    const key = playingFolderPath + '|' + loadedFile + '|' + secs;
     if (key === lastSavedProgressKey) return;
     lastSavedProgressKey = key;
 
-    setServerProgress(playingFolderPath, secs, fileUrl);
+    setServerProgress(playingFolderPath, secs, loadedFile);
 }
 
-// Called for each folder that contains MP3s, after the selector has been filled.
-// Resumes the saved track/position for this folder, otherwise starts at track 1.
+// Called for each folder that contains audio, after `tracks` has been built.
+// Resumes the saved file/position for this folder, otherwise starts at the beginning.
 async function loadTracks(folderPath) {
     initPlayerOnce();
 
     const audio = document.getElementById("audioPlayer");
-    const selector = document.getElementById("trackSelector");
     const myLoad = ++trackLoadSeq;
 
     playingFolderPath = folderPath || '';
@@ -667,9 +725,9 @@ async function loadTracks(folderPath) {
         title: (currentData && (currentData.Title || folderDisplayName(currentData.CurrentPath))) || '',
         author: (currentData && currentData.Author) || ''
     };
-    if (selector.length === 0) return;
+    if (tracks.length === 0) return;
 
-    let startFile = selector.options[0].value;
+    let startFile = tracks[0].file;
     let startTime = 0;
 
     pendingResumeFolder = playingFolderPath;
@@ -679,8 +737,7 @@ async function loadTracks(folderPath) {
 
         if (prog && prog.ok && prog.lastFileUrl) {
             const desired = String(prog.lastFileUrl);
-            const exists = Array.from(selector.options).some(o => o.value === desired);
-            if (exists) {
+            if (tracks.some(t => t.file === desired)) {
                 startFile = desired;
                 startTime = Math.max(0, Number(prog.lastTimeSeconds) || 0);
             }
@@ -690,10 +747,10 @@ async function loadTracks(folderPath) {
     }
     if (myLoad !== trackLoadSeq) return;
 
-    // If the user picked a track while progress was loading, respect that choice.
+    // If the user picked a chapter while progress was loading, respect that choice.
     if (pendingResumeFolder !== playingFolderPath) return;
 
-    selector.value = startFile;
+    currentTrack = trackIndexAt(startFile, startTime);
     await setAudioFile(audio, startFile, startTime);
     pendingResumeFolder = null;
     if (myLoad !== trackLoadSeq) return;
@@ -701,24 +758,82 @@ async function loadTracks(folderPath) {
     playAudio(audio);
 }
 
-function updateHighlights() {
+// ---- Playlist helpers ------------------------------------------------------
+
+function firstTrackOfFile(file) {
+    return tracks.findIndex(t => t.file === file);
+}
+
+function lastTrackOfFile(file) {
+    for (let i = tracks.length - 1; i >= 0; i--) {
+        if (tracks[i].file === file) return i;
+    }
+    return -1;
+}
+
+// The chapter of `file` that contains `time` (a little slack, because a seek can
+// land a few milliseconds before the requested spot).
+function trackIndexAt(file, time) {
+    let found = -1;
+    for (let i = 0; i < tracks.length; i++) {
+        const t = tracks[i];
+        if (t.file !== file) continue;
+        if (found < 0 || t.start <= time + 0.25) found = i;
+    }
+    return found;
+}
+
+// Keep currentTrack in step with playback (chapters change by themselves inside one file).
+function syncCurrentTrack() {
     const audio = document.getElementById("audioPlayer");
-    const selector = document.getElementById("trackSelector");
-    const currentPath = selector.value;
-    const fileElements = document.querySelectorAll("#content .file");
+    if (!audio || !loadedFile || seekPending || audio.readyState < 1) return;
+    const cur = tracks[currentTrack];
+    if (cur && cur.file !== loadedFile) return; // switching files
+    const time = audio.currentTime || 0;
+    if (cur && time >= cur.start - 0.25 && (cur.end === null || time < cur.end - 0.05)) return;
+    const i = trackIndexAt(loadedFile, time);
+    if (i >= 0) currentTrack = i;
+}
 
-    let currentIndex = -1;
-    fileElements.forEach((el, i) => {
-        if (el.dataset.path === currentPath) currentIndex = i;
-    });
+// Start and length of the current chapter, in seconds within the loaded file.
+function chapterBounds() {
+    const audio = document.getElementById("audioPlayer");
+    const dur = audioDuration(audio);
+    const t = tracks[currentTrack];
+    if (!t || t.file !== loadedFile) return { start: 0, len: dur };
+    const end = t.end !== null ? (dur ? Math.min(t.end, dur) : t.end) : dur;
+    return { start: t.start, len: Math.max(0, end - t.start) };
+}
 
-    fileElements.forEach((el, i) => {
-        const isCurrent = i === currentIndex;
-        el.classList.toggle("is-done", i < currentIndex && !el.classList.contains('is-doc'));
+// Play chapter i from its start (switching files only when needed).
+function playTrack(i) {
+    const t = tracks[i];
+    if (!t) return;
+    const audio = document.getElementById("audioPlayer");
+    currentTrack = i;
+    if (t.file === loadedFile && audio.getAttribute('src') && audio.readyState >= 1 && !seekPending) {
+        audio.currentTime = t.start;
+        playAudio(audio);
+    } else {
+        setAudioFileAndPlay(audio, t.file, t.start);
+    }
+}
+
+function updateHighlights() {
+    syncCurrentTrack();
+    const audio = document.getElementById("audioPlayer");
+    const fileElements = document.querySelectorAll("#content .file[data-track]");
+    const b = chapterBounds();
+
+    fileElements.forEach(el => {
+        const i = parseInt(el.dataset.track, 10);
+        const isCurrent = i === currentTrack;
+        el.classList.toggle("is-done", currentTrack >= 0 && i < currentTrack);
         el.classList.toggle("is-current", isCurrent);
         if (isCurrent) {
             el.setAttribute('aria-current', 'true');
-            const pct = audio.duration > 0 ? (audio.currentTime / audio.duration) * 100 : 0;
+            const pos = (audio.currentTime || 0) - b.start;
+            const pct = b.len > 0 ? Math.min(100, Math.max(0, (pos / b.len) * 100)) : 0;
             el.style.setProperty('--p', pct.toFixed(2) + '%');
         } else {
             el.removeAttribute('aria-current');
@@ -729,59 +844,48 @@ function updateHighlights() {
     updateNowPlaying();
 }
 
+// +30 s: moves through chapters naturally; spills into the next file at the end of this one.
 function goForwardSec(sec) {
     const audio = document.getElementById("audioPlayer");
-    const selector = document.getElementById("trackSelector");
 
     const forward = Math.abs(Number(sec) || 0);
     if (forward <= 0) return;
 
-    // If metadata not loaded yet, fall back to a simple add.
-    const canUseDuration = Number.isFinite(audio.duration) && audio.duration > 0;
-
-    if (!canUseDuration) {
-        audio.currentTime = Math.max(0, (audio.currentTime || 0) + forward);
-        return;
-    }
-
+    const dur = audioDuration(audio);
     const targetTime = (audio.currentTime || 0) + forward;
 
-    // Within current track
-    if (targetTime < audio.duration) {
+    // Within the current file (or metadata not loaded yet)
+    if (!dur || targetTime < dur) {
         audio.currentTime = targetTime;
         return;
     }
 
-    // Spill into next track
-    const remaining = targetTime - audio.duration;
-    const currentIndex = selector.selectedIndex;
-
-    // No next track: clamp to end
-    if (currentIndex < 0 || currentIndex >= selector.options.length - 1) {
-        audio.currentTime = audio.duration;
+    // No next file: clamp to end
+    const next = lastTrackOfFile(loadedFile) + 1;
+    if (next <= 0 || next >= tracks.length) {
+        audio.currentTime = dur;
         return;
     }
 
-    const nextOption = selector.options[currentIndex + 1];
-    selector.value = nextOption.value;
-    setAudioFileAndPlay(audio, nextOption.value, dur => Math.min(remaining, dur));
+    const remaining = targetTime - dur;
+    currentTrack = next;
+    setAudioFileAndPlay(audio, tracks[next].file, remaining);
 }
 
+// -30 s: spills back into the end of the previous file at the start of this one.
 function goBackSec(sec) {
     const audio = document.getElementById("audioPlayer");
-    const selector = document.getElementById("trackSelector");
 
     if (audio.currentTime > sec) {
         audio.currentTime -= sec;
         return;
     }
 
-    const currentIndex = selector.selectedIndex;
-    if (currentIndex > 0) { // was "> 1", which blocked going back from track 2 to track 1
-        const prevOption = selector.options[currentIndex - 1];
+    const prev = firstTrackOfFile(loadedFile) - 1;
+    if (prev >= 0) {
         const offset = sec - audio.currentTime;
-        selector.value = prevOption.value;
-        setAudioFileAndPlay(audio, prevOption.value, dur => Math.max(0, dur - offset));
+        currentTrack = prev;
+        setAudioFileAndPlay(audio, tracks[prev].file, dur => Math.max(0, dur - offset));
     } else {
         audio.currentTime = 0;
     }
@@ -953,8 +1057,10 @@ function setAudioFileAndPlay(audio, sFile, startTime = 0) {
 async function setAudioFile(audio, sFile, startTime = 0) {
     const myToken = ++audioLoadToken;
 
-    // When switching tracks, show "Play" until playback actually starts.
+    // When switching tracks, show "Play" until playback actually starts,
+    // with the loading ring until the new file can play.
     setPlayButtonsState(false);
+    setLoading(true);
 
     let src = sFile;
     let objectUrl = null;
@@ -981,7 +1087,9 @@ async function setAudioFile(audio, sFile, startTime = 0) {
     if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
     currentObjectUrl = objectUrl;
 
+    loadedFile = sFile;
     const needsSeek = typeof startTime === 'function' || startTime > 0;
+    seekPending = needsSeek;
     const metadataReady = needsSeek
         ? new Promise(resolve => {
             audio.addEventListener('loadedmetadata', function onMeta() {
@@ -991,6 +1099,7 @@ async function setAudioFile(audio, sFile, startTime = 0) {
                     let t = typeof startTime === 'function' ? startTime(dur) : startTime;
                     if (dur > 0) t = Math.min(t, Math.max(0, dur - 1));
                     try { audio.currentTime = Math.max(0, t || 0); } catch (e) { /* ignore */ }
+                    seekPending = false;
                 }
                 resolve();
             });
@@ -1002,7 +1111,13 @@ async function setAudioFile(audio, sFile, startTime = 0) {
     // Wait for the seek so playback starts at the right spot, not at 0:00 then jumps.
     if (metadataReady) {
         await Promise.race([metadataReady, new Promise(r => setTimeout(r, 15000))]);
+        if (myToken === audioLoadToken) seekPending = false;
     }
+}
+
+// Files of the open book, in order (an M4B is one file however many chapters it has).
+function playlistFiles() {
+    return [...new Set(tracks.map(t => t.file))];
 }
 
 async function cacheFolder() {
@@ -1011,18 +1126,18 @@ async function cacheFolder() {
         alert('Offline downloads need the site to be opened over HTTPS.');
         return;
     }
-    const selector = document.getElementById("trackSelector");
-    const total = selector.options.length;
+    const files = playlistFiles();
+    const total = files.length;
     btn.disabled = true;
 
     try {
         for (let i = 0; i < total; i++) {
-            setCacheButton('busy', `${i + 1} of ${total}`);
+            setCacheButton('busy', total > 1 ? `${i + 1} of ${total}` : 'Saving…');
             try {
-                await downloadAndCache(selector.options[i].value, i);
+                await downloadAndCache(files[i]);
             } catch (e) {
-                console.error('Caching failed for', selector.options[i].value, e);
-                setCacheIcon(i, false);
+                console.error('Caching failed for', files[i], e);
+                setCacheIcon(files[i], false);
             }
         }
     } finally {
@@ -1042,52 +1157,53 @@ function setCacheButton(state, text) {
     btn.title = state === 'done' ? 'All chapters are saved for offline listening' : 'Save all chapters for offline listening';
 }
 
-async function downloadAndCache(sFile, i) {
+async function downloadAndCache(sFile) {
     const cache = await caches.open('mp3-cache');
     const match = await cache.match(sFile);
     if (match) {
-        setCacheIcon(i, true);
+        setCacheIcon(sFile, true);
         return;
     }
 
     const response = await fetch(sFile);
 
     if (!response.ok) {
-        setCacheIcon(i, false);
+        setCacheIcon(sFile, false);
         return;
     }
 
     await cache.put(sFile, response);
-    setCacheIcon(i, true);
+    setCacheIcon(sFile, true);
 }
 
 async function checkFolderCache() {
     if (!('caches' in window)) return;
-    const selector = document.getElementById("trackSelector");
-    const total = selector.options.length;
+    const files = playlistFiles();
     let cached = 0;
-    for (let i = 0; i < total; i++) {
+    for (const f of files) {
         try {
-            if (await checkCache(selector.options[i].value, i)) cached++;
+            if (await checkCache(f)) cached++;
         } catch (e) {
             // ignore
         }
     }
     const btn = document.getElementById("btnCacheFolder");
-    if (btn && !btn.disabled) setCacheButton(total > 0 && cached === total ? 'done' : 'idle');
+    if (btn && !btn.disabled) setCacheButton(files.length > 0 && cached === files.length ? 'done' : 'idle');
 }
 
-async function checkCache(sFile, i) {
+async function checkCache(sFile) {
     const cache = await caches.open('mp3-cache');
     const match = await cache.match(sFile);
-    setCacheIcon(i, !!match);
+    setCacheIcon(sFile, !!match);
     return !!match;
 }
 
-function setCacheIcon(i, match) {
-    // The user may have navigated to another folder while this was running.
-    const li = document.querySelector(`li.file[data-index="${i}"]`);
-    if (li) li.classList.toggle('is-cached', !!match);
+// Marks every chapter row that belongs to the file. Rows that aren't there any more
+// (the user moved to another folder meanwhile) are simply not found.
+function setCacheIcon(file, match) {
+    document.querySelectorAll('#content li.file[data-file]').forEach(li => {
+        if (li.dataset.file === file) li.classList.toggle('is-cached', !!match);
+    });
 }
 
 // Builds the Web Audio chain the first time it's needed (boost above 100% or
@@ -1739,26 +1855,35 @@ function initPlayerUI(audio) {
     ['play', 'pause', 'ended', 'loadedmetadata', 'canplay'].forEach(ev =>
         audio.addEventListener(ev, syncPlayPauseUI));
 
+    // Loading ring on the play buttons: shown while the browser is fetching audio it
+    // needs right now (opening a file, a jump into a big M4B, buffering on a slow
+    // connection), hidden as soon as it can play or the user pauses.
+    audio.addEventListener('waiting', () => setLoading(true));
+    audio.addEventListener('seeking', () => { if (!audio.paused) setLoading(true); });
+    ['playing', 'canplay', 'canplaythrough', 'pause', 'ended', 'error'].forEach(ev =>
+        audio.addEventListener(ev, () => setLoading(false)));
+    audio.addEventListener('seeked', () => { if (audio.paused || audio.readyState >= 3) setLoading(false); });
+
     // Previous / next chapter
     const prev = document.getElementById('prevTrackButton');
     const next = document.getElementById('nextTrackButton');
     if (prev) prev.addEventListener('click', () => previousChapter());
     if (next) next.addEventListener('click', () => goToTrack(1));
 
-    // Seek bar: preview while dragging, seek on release
+    // Seek bar (covers the current chapter): preview while dragging, seek on release
     const seekBar = document.getElementById('seekBar');
     if (seekBar) {
         seekBar.addEventListener('input', () => {
             isSeeking = true;
-            const dur = audioDuration(audio);
-            const t = dur * (seekBar.value / 1000);
+            const len = chapterBounds().len;
+            const t = len * (seekBar.value / 1000);
             seekBar.style.setProperty('--pct', (seekBar.value / 10) + '%');
             setText('timeElapsed', formatTime(t));
-            setText('timeRemaining', dur ? '-' + formatTime(dur - t) : '');
+            setText('timeRemaining', len ? '-' + formatTime(len - t) : '');
         });
         seekBar.addEventListener('change', () => {
-            const dur = audioDuration(audio);
-            if (dur) audio.currentTime = dur * (seekBar.value / 1000);
+            const b = chapterBounds();
+            if (b.len) audio.currentTime = b.start + b.len * (seekBar.value / 1000);
             isSeeking = false;
             updateTimes();
         });
@@ -1815,6 +1940,16 @@ function togglePlay() {
     syncPlayPauseUI();
 }
 
+function setLoading(isLoading) {
+    ['playPauseButton', 'miniPlayButton'].forEach(id => {
+        const b = document.getElementById(id);
+        if (!b) return;
+        b.classList.toggle('is-loading', !!isLoading);
+        if (isLoading) b.setAttribute('aria-busy', 'true');
+        else b.removeAttribute('aria-busy');
+    });
+}
+
 function syncPlayPauseUI() {
     const audio = document.getElementById('audioPlayer');
     const isPlaying = !!audio && audio.readyState >= 1 && !audio.paused && !audio.ended;
@@ -1838,22 +1973,22 @@ function setPlayButtonsState(isPlaying) {
 // Previous: restart the chapter if we're more than 5 s in, otherwise go back one.
 function previousChapter() {
     const audio = document.getElementById('audioPlayer');
-    if (audio && audio.currentTime > 5) {
-        audio.currentTime = 0;
+    syncCurrentTrack();
+    const b = chapterBounds();
+    if (audio && (audio.currentTime || 0) - b.start > 5) {
+        audio.currentTime = b.start;
         return;
     }
     goToTrack(-1);
 }
 
 function goToTrack(delta) {
-    const audio = document.getElementById('audioPlayer');
-    const selector = document.getElementById('trackSelector');
-    const i = selector.selectedIndex + delta;
-    if (i < 0 || i >= selector.options.length) return;
-    selector.selectedIndex = i;
+    syncCurrentTrack();
+    const i = currentTrack + delta;
+    if (currentTrack < 0 || i < 0 || i >= tracks.length) return;
     pendingResumeFolder = null;
-    setAudioFileAndPlay(audio, selector.value);
-    if (playingFolderPath) setServerProgress(playingFolderPath, 0, selector.value);
+    playTrack(i);
+    if (playingFolderPath) setServerProgress(playingFolderPath, Math.floor(tracks[i].start), tracks[i].file);
 }
 
 function audioDuration(audio) {
@@ -1863,8 +1998,11 @@ function audioDuration(audio) {
 function updateTimes() {
     const audio = document.getElementById('audioPlayer');
     if (!audio) return;
-    const dur = audioDuration(audio);
-    const cur = audio.currentTime || 0;
+    // Everything here is relative to the current chapter, which for an M4B is a slice of the file.
+    syncCurrentTrack();
+    const b = chapterBounds();
+    const dur = b.len;
+    const cur = Math.min(Math.max(0, (audio.currentTime || 0) - b.start), dur || Infinity);
     const pct = dur ? Math.min(100, (cur / dur) * 100) : 0;
 
     const seekBar = document.getElementById('seekBar');
@@ -1891,13 +2029,11 @@ function updateTimes() {
 }
 
 function updateNowPlaying() {
-    const selector = document.getElementById('trackSelector');
-    if (!selector) return;
-    const idx = selector.selectedIndex;
-    const total = selector.options.length;
-    const title = idx >= 0 ? selector.options[idx].textContent : '';
+    const idx = currentTrack;
+    const total = tracks.length;
+    const title = idx >= 0 && tracks[idx] ? tracks[idx].title : '';
 
-    setText('npIndex', total ? `Chapter ${idx + 1} of ${total}` : '');
+    setText('npIndex', total && idx >= 0 ? `Chapter ${idx + 1} of ${total}` : '');
     setText('npTitle', title);
     setText('miniTitle', title);
     setText('miniSub', playingBook.title);
@@ -1948,7 +2084,7 @@ function initMediaSession(audio) {
         seekforward: d => goForwardSec((d && d.seekOffset) || 30),
         previoustrack: () => previousChapter(),
         nexttrack: () => goToTrack(1),
-        seekto: d => { if (d && typeof d.seekTime === 'number') audio.currentTime = d.seekTime; }
+        seekto: d => { if (d && typeof d.seekTime === 'number') audio.currentTime = chapterBounds().start + d.seekTime; }
     };
     Object.keys(handlers).forEach(action => {
         try { navigator.mediaSession.setActionHandler(action, handlers[action]); } catch (e) { /* unsupported action */ }

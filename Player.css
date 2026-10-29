@@ -1,4 +1,4 @@
-﻿/* ==========================================================================
+/* ==========================================================================
    Audiobooks: "reading room" palette. Bottle green for actions, brass for
    ratings, Literata for book and chapter titles, system UI font for controls.
    ========================================================================== */
@@ -506,6 +506,21 @@ button { font: inherit; color: inherit; }
     padding: 1px 5px;
 }
 
+/* File name above its chapters when a folder has several chaptered files (Part 1.m4b, Part 2.m4b) */
+.file-group {
+    padding: 18px 8px 6px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--ink-3);
+    border-bottom: 1px solid var(--line);
+    overflow-wrap: anywhere;
+}
+.chapter-list .file-group:first-child { padding-top: 4px; }
+
+/* Audio this browser can't play (e.g. .ogg on an older iPhone): opens in a new tab instead */
+.file.is-unsupported .ch-title { color: var(--ink-3); }
+.ch-note { display: block; font-family: var(--sans); font-size: 0.78rem; color: var(--ink-3); }
+
 .file.is-done .ch-num { display: none; }
 .file.is-done .ch-check { display: block; }
 .file.is-done .ch-title { color: var(--ink-3); }
@@ -693,6 +708,31 @@ table.dataTable.no-footer { border-bottom: none; }
 
 .tbtn.play.small { width: 48px; height: 48px; }
 .tbtn.play.small .icon { width: 24px; height: 24px; }
+
+/* Loading ring around the play button while audio is being fetched. It fades in after
+   a short delay, so quick loads don't flicker. */
+.tbtn.play { position: relative; }
+.tbtn.play::after {
+    content: "";
+    position: absolute;
+    inset: -5px;
+    border-radius: 50%;
+    border: 3px solid transparent;
+    border-top-color: var(--accent);
+    border-right-color: var(--accent);
+    opacity: 0;
+    pointer-events: none;
+}
+.tbtn.play.is-loading::after {
+    animation: spin 0.9s linear infinite, ring-in 0.2s ease-out 0.35s forwards;
+}
+.tbtn.play.small::after { inset: -4px; border-width: 2px; }
+@keyframes ring-in { to { opacity: 1; } }
+
+@media (prefers-reduced-motion: reduce) {
+    /* No spinning: a steady ring still says "loading" */
+    .tbtn.play.is-loading::after { animation: none !important; opacity: 1; border-color: var(--accent-soft); border-top-color: var(--accent); }
+}
 
 /* ---------- Toast, spinner ---------- */
 
